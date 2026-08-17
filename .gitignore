@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Claude Code
+.claude/worktrees/
+
+# Editor
+.vscode/
+.DS_Store
+
+# Data / logs
+*.log
+*.gdb
+*.gpkg
+output/
+data/
