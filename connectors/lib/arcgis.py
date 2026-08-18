@@ -257,3 +257,15 @@ def _iter_by_ids(
         }
         result = _raw_query(base_url, params, session, token, timeout)
         yield from result.get("features", [])
+
+
+def feature_props(feature: dict) -> dict:
+    return feature.get("properties") or feature.get("attributes") or {}
+
+
+def feature_lonlat(feature: dict) -> tuple[float | None, float | None]:
+    geom = feature.get("geometry") or {}
+    coords = geom.get("coordinates")
+    if coords and len(coords) >= 2:
+        return float(coords[0]), float(coords[1])
+    return None, None

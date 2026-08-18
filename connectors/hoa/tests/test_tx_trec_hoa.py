@@ -406,17 +406,17 @@ class TestAssertSourceShape:
 
     def test_raises_on_missing_name_column(self):
         df = self._well_formed_df().drop(columns=["Name"])
-        with pytest.raises(AssertionError, match="missing column"):
+        with pytest.raises(ValueError, match="missing column"):
             mod.assert_source_shape(df)
 
     def test_raises_on_missing_county_column(self):
         df = self._well_formed_df().drop(columns=["County"])
-        with pytest.raises(AssertionError, match="missing column"):
+        with pytest.raises(ValueError, match="missing column"):
             mod.assert_source_shape(df)
 
     def test_raises_on_missing_certificate_column(self):
         df = self._well_formed_df().drop(columns=["Certificate"])
-        with pytest.raises(AssertionError, match="missing column"):
+        with pytest.raises(ValueError, match="missing column"):
             mod.assert_source_shape(df)
 
     def test_raises_when_url_parse_rate_drops_below_98_percent(self):
@@ -428,25 +428,25 @@ class TestAssertSourceShape:
         # Set 5 rows to junk URLs — 5% failure rate exceeds the 2% threshold
         for i in range(5):
             df.loc[i, "Certificate"] = "https://hoa.texas.gov/NOT_A_CERT/"
-        with pytest.raises(AssertionError, match="certificate URL"):
+        with pytest.raises(ValueError, match="certificate URL"):
             mod.assert_source_shape(df)
 
     def test_raises_on_unmapped_type_value(self):
         df = self._well_formed_df()
         df.loc[0, "Type"] = "UNKNOWN_TYPE"
-        with pytest.raises(AssertionError, match="unmapped Type"):
+        with pytest.raises(ValueError, match="unmapped Type"):
             mod.assert_source_shape(df)
 
     def test_raises_when_name_fill_rate_below_99_percent(self):
         df = self._well_formed_df(n=200)
         for i in range(10):
             df.loc[i, "Name"] = ""
-        with pytest.raises(AssertionError, match="Name"):
+        with pytest.raises(ValueError, match="Name"):
             mod.assert_source_shape(df)
 
     def test_raises_when_type_fill_rate_below_99_percent(self):
         df = self._well_formed_df(n=200)
         for i in range(10):
             df.loc[i, "Type"] = ""
-        with pytest.raises(AssertionError, match="Type"):
+        with pytest.raises(ValueError, match="Type"):
             mod.assert_source_shape(df)

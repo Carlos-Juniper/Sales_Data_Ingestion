@@ -66,7 +66,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import json
 import sys
 from dataclasses import dataclass, field
@@ -74,9 +73,11 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import requests
 import yaml
 
 from lib.arcgis import make_session, spatial_point_lookup
+from lib.enrich_runner import run_enrichment
 from lib.normalize import normalize_name
 
 SOURCE_ID = "parcel_acreage_enrich"
@@ -189,12 +190,10 @@ def _build_layer_maps(
     return statewide, county
 
 
-# Module-level registries populated from the default YAML at import time.
-# Use load_layer_config() + _build_layer_maps() to swap in a different file.
-_raw_config = load_layer_config()
-STATE_LAYERS: dict[str, LayerConfig]
-_COUNTY_LAYERS: dict[str, dict[str, LayerConfig]]
-STATE_LAYERS, _COUNTY_LAYERS = _build_layer_maps(_raw_config)
+# Layer registries are intentionally NOT populated at module level.
+# load_layer_config() performs file I/O; doing it on import breaks tests and
+# tool scripts that don't have the YAML present.  Call _build_layer_maps() once
+# inside enrich() or main() and pass the results through as parameters.
 
 # SC: no statewide ArcGIS layer. First pass is manual county assessor CSV.
 # This connector emits state_not_supported for SC rows.
@@ -204,14 +203,19 @@ STATE_LAYERS, _COUNTY_LAYERS = _build_layer_maps(_raw_config)
 # ---------------------------------------------------------------- layer resolution
 
 
-def get_layer_config(state: str, county_fips: str | None) -> LayerConfig | None:
+def get_layer_config(
+    state: str,
+    county_fips: str | None,
+    state_layers: dict[str, LayerConfig],
+    county_layers: dict[str, dict[str, LayerConfig]],
+) -> LayerConfig | None:
     """
     Return the LayerConfig for a given state/county combination, or None when
     not yet configured (emits county_not_configured) or unsupported (SC).
     """
-    if state in STATE_LAYERS:
-        return STATE_LAYERS[state]
-    county_map = _COUNTY_LAYERS.get(state)
+    if state in state_layers:
+        return state_layers[state]
+    county_map = county_layers.get(state)
     if county_map is not None:
         return county_map.get(county_fips or "")
     return None  # SC and any unknown state
@@ -254,6 +258,8 @@ def lookup_parcel(
     lon: float | None,
     county_fips: str | None,
     session: Any,
+    state_layers: dict[str, LayerConfig],
+    county_layers: dict[str, dict[str, LayerConfig]],
 ) -> EnrichmentResult:
     result = EnrichmentResult(natural_key=natural_key, state=state)
 
@@ -267,9 +273,9 @@ def lookup_parcel(
         result.lookup_note = "SC has no statewide ArcGIS parcel layer; pull county assessor CSVs manually"
         return result
 
-    config = get_layer_config(state, county_fips)
+    config = get_layer_config(state, county_fips, state_layers, county_layers)
     if config is None:
-        if state in _COUNTY_LAYERS:
+        if state in county_layers:
             # State is known but this FIPS has no entry yet — add it to the YAML.
             result.lookup_status = "county_not_configured"
             result.lookup_note = (
@@ -289,9 +295,13 @@ def lookup_parcel(
             out_fields=config.out_fields,
             session=session,
         )
-    except Exception as exc:
+    except requests.RequestException as exc:
         result.lookup_status = "error"
-        result.lookup_note = str(exc)
+        result.lookup_note = f"network: {exc}"
+        return result
+    except (ValueError, KeyError) as exc:
+        result.lookup_status = "error"
+        result.lookup_note = f"parse: {exc}"
         return result
 
     if not features:
@@ -370,6 +380,7 @@ def enrich(
     df: pd.DataFrame,
     workers: int = 1,
     state_filter: str | None = None,
+    config_path: str | Path | None = None,
 ) -> pd.DataFrame:
     """
     Run parcel lookups for every row in df that has latitude/longitude.
@@ -379,10 +390,22 @@ def enrich(
 
     Returns a DataFrame with one row per input row, columns matching
     EnrichmentResult fields.
+
+    Parameters
+    ----------
+    config_path:
+        Optional path to a parcel_layers YAML. Defaults to the bundled
+        config/parcel_layers.yaml. The YAML is loaded exactly once per call,
+        not per row.
     """
     if state_filter:
         df = df[df["site_state"].str.upper() == state_filter.upper()]
         print(f"  state filter: {state_filter} → {len(df):,} rows", file=sys.stderr)
+
+    # Load layer config once here — not at module level — so the module can be
+    # imported in tests and tool scripts without the YAML present.
+    raw_config = load_layer_config(config_path)
+    state_layers, county_layers = _build_layer_maps(raw_config)
 
     # One shared Session is intentional: requests.Session is thread-safe for
     # concurrent .get() calls because urllib3's connection pool is internally
@@ -402,28 +425,22 @@ def enrich(
             lon=lon,
             county_fips=fips,
             session=session,
+            state_layers=state_layers,
+            county_layers=county_layers,
         )
         return res.__dict__
 
-    rows = df.to_dict("records")
-    results: list[dict[str, Any]] = []
+    indexed_rows: list[tuple[Any, Any]] = list(enumerate(df.to_dict("records")))
 
-    if workers <= 1:
-        for i, row in enumerate(rows, 1):
-            res = _lookup_row(row)
-            results.append(res)
-            if i % 50 == 0 or i == len(rows):
-                _print_progress(i, len(rows), results)
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_lookup_row, row): i for i, row in enumerate(rows)}
-            done = 0
-            for fut in concurrent.futures.as_completed(futures):
-                results.append(fut.result())
-                done += 1
-                if done % 50 == 0 or done == len(rows):
-                    _print_progress(done, len(rows), results)
+    pairs = run_enrichment(
+        indexed_rows,
+        _lookup_row,
+        workers=workers,
+        label="parcel",
+    )
 
+    # run_enrichment preserves original order; drop the index to get plain dicts.
+    results = [result for _, result in pairs]
     return pd.DataFrame(results)
 
 
@@ -433,16 +450,6 @@ def _to_float(val: Any) -> float | None:
         return f if f == f else None  # NaN check
     except (TypeError, ValueError):
         return None
-
-
-def _print_progress(done: int, total: int, results: list[dict]) -> None:
-    statuses = pd.Series([r["lookup_status"] for r in results]).value_counts()
-    ok = statuses.get("ok", 0) + statuses.get("ok_multi_parcel", 0)
-    pct = 100 * done / total
-    print(
-        f"  {done:>{len(str(total))}}/{total} ({pct:.0f}%)  ok={ok}",
-        file=sys.stderr,
-    )
 
 
 # ---------------------------------------------------------------- summary
@@ -491,8 +498,6 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.config:
-        global STATE_LAYERS, _COUNTY_LAYERS  # noqa: PLW0603
-        STATE_LAYERS, _COUNTY_LAYERS = _build_layer_maps(load_layer_config(args.config))
         print(f"using layer config: {args.config}", file=sys.stderr)
 
     print(f"reading {args.input}", file=sys.stderr)
@@ -505,7 +510,7 @@ def main() -> None:
     print(f"  {len(df):,} rows loaded", file=sys.stderr)
 
     print(f"\nrunning parcel lookups (workers={args.workers})", file=sys.stderr)
-    results = enrich(df, workers=args.workers, state_filter=args.state)
+    results = enrich(df, workers=args.workers, state_filter=args.state, config_path=args.config)
 
     results.to_csv(args.out, index=False)
     print(f"\nwrote {len(results):,} rows -> {args.out}", file=sys.stderr)

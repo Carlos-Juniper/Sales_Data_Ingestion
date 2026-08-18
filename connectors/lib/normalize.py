@@ -16,7 +16,6 @@ _CORP_SUFFIXES = re.compile(
 _NON_ALNUM = re.compile(r"[^A-Z0-9 ]")
 _WHITESPACE = re.compile(r"\s+")
 _NON_DIGIT = re.compile(r"\D")
-_NON_PHONE_DIGIT = re.compile(r"[^\d]")
 
 
 def normalize_name(s: str | None) -> str:
@@ -47,5 +46,16 @@ def normalize_phone(s: str | None) -> str:
     """Strip everything but digits. Returns "" when result is under 10 digits."""
     if not s:
         return ""
-    digits = _NON_PHONE_DIGIT.sub("", str(s))
+    digits = _NON_DIGIT.sub("", str(s))
     return digits if len(digits) >= 10 else ""
+
+
+def int_key(v) -> str:
+    """Convert a float-typed integer key (as returned by ArcGIS) to a clean string.
+    Returns empty string for null/NaN values."""
+    if v is None:
+        return ""
+    try:
+        return str(int(v))
+    except (ValueError, TypeError):
+        return ""

@@ -6,6 +6,11 @@ test_parcel_enrich.py.  Everything in this file is pure in-memory data;
 no network or filesystem side-effects occur during setup.
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import pytest
 
 
