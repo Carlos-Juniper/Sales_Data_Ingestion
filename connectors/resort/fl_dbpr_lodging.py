@@ -29,6 +29,8 @@ import sys
 
 import pandas as pd
 
+from lib.normalize import normalize_name, normalize_zip
+
 # ---------------------------------------------------------------- constants
 
 SOURCE_ID = "fl_dbpr_lodging"
@@ -95,15 +97,11 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     df["vertical"] = df["Rank Code"].map(lambda r: RANK_MAP.get(r, ("resort", False))[0])
     df["_keep_rank"] = df["Rank Code"].map(lambda r: RANK_MAP.get(r, ("resort", False))[1])
 
-    # TODO: migrate to lib/normalize.normalize_name
     for col in ("Location Street Address", "Location City", "Licensee Name", "Business Name"):
-        df[col + "_norm"] = (
-            df[col].str.upper().str.replace(r"\s+", " ", regex=True).str.strip()
-        )
+        df[col + "_norm"] = df[col].map(normalize_name)
 
     # ZIP arrives as both 33139 and 331394209 and 33139-5808.
-    # TODO: migrate to lib/normalize.normalize_zip
-    df["zip5"] = df["Location Zip Code"].str.replace(r"\D", "", regex=True).str[:5]
+    df["zip5"] = df["Location Zip Code"].map(normalize_zip)
     df["is_association"] = df["Licensee Name"].str.contains(ASSOC_PATTERN, na=False)
     return df
 
@@ -192,21 +190,26 @@ def to_canonical(df: pd.DataFrame) -> pd.DataFrame:
 
 def assert_source_shape(df: pd.DataFrame) -> None:
     """Fail loudly if DBPR changes the layout out from under us."""
-    assert UNIT_COL in df.columns, f"missing size field {UNIT_COL!r} — layout changed"
+    if UNIT_COL not in df.columns:
+        raise ValueError(f"missing size field {UNIT_COL!r} — layout changed")
 
     fill = (df[UNIT_COL].str.strip() != "").mean()
-    assert fill > 0.99, f"{UNIT_COL} only {fill:.1%} populated (expected 100%)"
+    if not fill > 0.99:
+        raise ValueError(f"{UNIT_COL} only {fill:.1%} populated (expected 100%)")
 
     for col in ("Licensee Name", "Location Street Address", "License Number"):
         f = (df[col].str.strip() != "").mean()
-        assert f > 0.99, f"{col} only {f:.1%} populated"
+        if not f > 0.99:
+            raise ValueError(f"{col} only {f:.1%} populated")
 
-    assert "Primary Status Code" in df.columns, (
-        "missing column 'Primary Status Code' — layout changed; filter_qualified will KeyError"
-    )
+    if "Primary Status Code" not in df.columns:
+        raise ValueError(
+            "missing column 'Primary Status Code' — layout changed; filter_qualified will KeyError"
+        )
 
     unknown = set(df["Rank Code"].unique()) - set(RANK_MAP)
-    assert not unknown, f"unmapped Rank Code(s): {unknown} — route them before loading"
+    if unknown:
+        raise ValueError(f"unmapped Rank Code(s): {unknown} — route them before loading")
 
 
 # ---------------------------------------------------------------- entrypoint

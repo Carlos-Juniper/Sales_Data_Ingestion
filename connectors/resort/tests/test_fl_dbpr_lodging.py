@@ -444,30 +444,30 @@ class TestAssertSourceShape:
     def test_raises_when_unit_col_missing(self):
         df = self._well_formed_df()
         df = df.drop(columns=[mod.UNIT_COL])
-        with pytest.raises(AssertionError, match="missing size field"):
+        with pytest.raises(ValueError, match="missing size field"):
             mod.assert_source_shape(df)
 
     def test_raises_when_unit_col_fill_rate_below_99_percent(self):
         df = self._well_formed_df(n=200)
         # Set 10 rows (5%) to empty string — crosses the 1% threshold.
         df.loc[:9, mod.UNIT_COL] = ""
-        with pytest.raises(AssertionError, match=mod.UNIT_COL):
+        with pytest.raises(ValueError, match=mod.UNIT_COL):
             mod.assert_source_shape(df)
 
     def test_raises_on_unmapped_rank_code(self):
         df = self._well_formed_df()
         df.loc[0, "Rank Code"] = "UNKN"
-        with pytest.raises(AssertionError, match="unmapped Rank Code"):
+        with pytest.raises(ValueError, match="unmapped Rank Code"):
             mod.assert_source_shape(df)
 
     def test_raises_when_licensee_name_fill_rate_below_99_percent(self):
         df = self._well_formed_df(n=200)
         df.loc[:9, "Licensee Name"] = ""
-        with pytest.raises(AssertionError, match="Licensee Name"):
+        with pytest.raises(ValueError, match="Licensee Name"):
             mod.assert_source_shape(df)
 
     def test_raises_when_location_street_address_fill_rate_below_99_percent(self):
         df = self._well_formed_df(n=200)
         df.loc[:9, "Location Street Address"] = ""
-        with pytest.raises(AssertionError, match="Location Street Address"):
+        with pytest.raises(ValueError, match="Location Street Address"):
             mod.assert_source_shape(df)

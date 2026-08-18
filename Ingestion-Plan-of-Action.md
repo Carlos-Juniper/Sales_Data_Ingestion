@@ -432,7 +432,7 @@ Three segments (commercial perpetual-care, religious, municipal) and **no single
 | **IRS Exempt Orgs BMF** — fixes the religious gap | Religious + nonprofit | `irs.gov/charities-non-profits/exempt-organizations-business-master-file-extract-eo-bmf` | Filter NTEE **Y50** / subsection **501(c)(13)**. Name, street address, city, state, ZIP, EIN | Public domain |
 | **VA National Cemetery Sites** | Federal | `datahub.va.gov/dataset/VA-National-Cemetery-Sites/fcxt-zc8r` | Name, address, phone. 157 nationally | Public domain |
 | **TxDOT Texas Cemeteries** | All, TX only | `gis-txdot.opendata.arcgis.com/datasets/TXDOT::texas-cemeteries/about` | Statewide points, denser than NSD | Public agency open data |
-| **FGDL / GeoPlan Cemetery Facilities** | All, FL only | `geodata.myflorida.com` dataset `d3b803ffb01c4fe3821a8e6b0e380679_0` | Compiled from ~24 sources — denser than NSD for FL | Public records |
+| **FGDL / GeoPlan Cemetery Facilities** | All, FL only | `services.arcgis.com/LBbVDC0hKPAnLRpO/arcgis/rest/services/gc_cemetery_dec24/FeatureServer/0` (ArcGIS Online item `22e1fa797e6a4fedbdfab4157a116a18`; original `geodata.myflorida.com` URL is dead as of 2026-08) | Compiled from ~24 sources — denser than NSD for FL; TYPE field carries 22 cemetery types including RELIGIOUS and MUNICIPAL | Public records |
 
 **State regulators — the only sources with phone numbers, but perpetual-care only.** The exemption is statutory, not incidental: municipal, city, church, and nonprofit cemeteries are outside these boards' jurisdiction by law. No amount of digging makes a licensee list cover churches.
 

@@ -5,16 +5,16 @@ spatial_point_lookup (imported inside parcel_acreage_enrich) is patched at
 its USE-SITE — 'parcel_acreage_enrich.spatial_point_lookup' — so no real
 HTTP calls are made.
 
-Module-level STATE_LAYERS / _COUNTY_LAYERS are built from the real
-config/parcel_layers.yaml at import time (which is fine — the file is on
-disk).  For tests that need a controlled minimal config we call
-_build_layer_maps() directly with the minimal_yaml fixture.
+Layer registries are no longer populated at module level (import-time file I/O
+was removed).  Tests that exercise state/county routing use either the
+real_layer_maps fixture (built once from the on-disk YAML) or pass maps derived
+from the minimal_yaml fixture directly to lookup_parcel.
 """
 
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import requests
 
 import parcel_acreage_enrich as pe
 from parcel_acreage_enrich import (
@@ -32,6 +32,20 @@ _PATCH_TARGET = "parcel_acreage_enrich.spatial_point_lookup"
 _FL_LAT = 28.538
 _FL_LON = -81.379
 _FAKE_SESSION = object()
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped fixture: real layer maps built once from the on-disk YAML.
+# Used by tests that exercise state/county routing (SC, TX, PA, unknown state)
+# because those tests rely on which states are registered in the real config.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def real_layer_maps():
+    """Build (state_layers, county_layers) from the default parcel_layers.yaml."""
+    raw = load_layer_config()
+    return _build_layer_maps(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -184,184 +198,229 @@ class TestExtractProperty:
 
 
 class TestLookupParcelNoGeometry:
+    # These tests exit before reaching get_layer_config, so empty registries suffice.
+    _SL: dict = {}
+    _CL: dict = {}
+
     def test_lat_none_returns_no_geometry_status(self):
-        result = lookup_parcel("KEY1", "FL", lat=None, lon=_FL_LON, county_fips=None, session=_FAKE_SESSION)
+        result = lookup_parcel("KEY1", "FL", lat=None, lon=_FL_LON, county_fips=None,
+                               session=_FAKE_SESSION, state_layers=self._SL, county_layers=self._CL)
         assert result.lookup_status == "no_geometry"
 
     def test_lon_none_returns_no_geometry_status(self):
-        result = lookup_parcel("KEY1", "FL", lat=_FL_LAT, lon=None, county_fips=None, session=_FAKE_SESSION)
+        result = lookup_parcel("KEY1", "FL", lat=_FL_LAT, lon=None, county_fips=None,
+                               session=_FAKE_SESSION, state_layers=self._SL, county_layers=self._CL)
         assert result.lookup_status == "no_geometry"
 
     def test_both_none_returns_no_geometry_status(self):
-        result = lookup_parcel("KEY1", "FL", lat=None, lon=None, county_fips=None, session=_FAKE_SESSION)
+        result = lookup_parcel("KEY1", "FL", lat=None, lon=None, county_fips=None,
+                               session=_FAKE_SESSION, state_layers=self._SL, county_layers=self._CL)
         assert result.lookup_status == "no_geometry"
 
     def test_no_geometry_note_mentions_geocode(self):
-        result = lookup_parcel("KEY1", "FL", lat=None, lon=None, county_fips=None, session=_FAKE_SESSION)
+        result = lookup_parcel("KEY1", "FL", lat=None, lon=None, county_fips=None,
+                               session=_FAKE_SESSION, state_layers=self._SL, county_layers=self._CL)
         assert "geocode" in result.lookup_note.lower()
 
 
 class TestLookupParcelStateNotSupported:
-    def test_sc_returns_state_not_supported(self):
-        result = lookup_parcel("KEY2", "SC", lat=33.0, lon=-80.0, county_fips=None, session=_FAKE_SESSION)
+    def test_sc_returns_state_not_supported(self, real_layer_maps):
+        sl, cl = real_layer_maps
+        result = lookup_parcel("KEY2", "SC", lat=33.0, lon=-80.0, county_fips=None,
+                               session=_FAKE_SESSION, state_layers=sl, county_layers=cl)
         assert result.lookup_status == "state_not_supported"
 
-    def test_sc_note_mentions_county_assessor(self):
-        result = lookup_parcel("KEY2", "SC", lat=33.0, lon=-80.0, county_fips=None, session=_FAKE_SESSION)
+    def test_sc_note_mentions_county_assessor(self, real_layer_maps):
+        sl, cl = real_layer_maps
+        result = lookup_parcel("KEY2", "SC", lat=33.0, lon=-80.0, county_fips=None,
+                               session=_FAKE_SESSION, state_layers=sl, county_layers=cl)
         assert "county assessor" in result.lookup_note.lower()
 
-    def test_unknown_state_returns_state_not_supported(self):
+    def test_unknown_state_returns_state_not_supported(self, real_layer_maps):
         # "ZZ" is not in any registry.
-        result = lookup_parcel("KEY3", "ZZ", lat=33.0, lon=-80.0, county_fips=None, session=_FAKE_SESSION)
+        sl, cl = real_layer_maps
+        result = lookup_parcel("KEY3", "ZZ", lat=33.0, lon=-80.0, county_fips=None,
+                               session=_FAKE_SESSION, state_layers=sl, county_layers=cl)
         assert result.lookup_status == "state_not_supported"
 
 
 class TestLookupParcelCountyNotConfigured:
-    def test_tx_with_unknown_fips_returns_county_not_configured(self):
-        # TX is in _COUNTY_LAYERS but FIPS "99999" has no entry.
+    def test_tx_with_unknown_fips_returns_county_not_configured(self, real_layer_maps):
+        # TX is in county_layers but FIPS "99999" has no entry.
+        sl, cl = real_layer_maps
         result = lookup_parcel(
             "KEY4", "TX", lat=29.76, lon=-95.36,
             county_fips="99999", session=_FAKE_SESSION,
+            state_layers=sl, county_layers=cl,
         )
         assert result.lookup_status == "county_not_configured"
 
-    def test_county_not_configured_note_mentions_fips(self):
+    def test_county_not_configured_note_mentions_fips(self, real_layer_maps):
+        sl, cl = real_layer_maps
         result = lookup_parcel(
             "KEY4", "TX", lat=29.76, lon=-95.36,
             county_fips="99999", session=_FAKE_SESSION,
+            state_layers=sl, county_layers=cl,
         )
         assert "99999" in result.lookup_note
 
-    def test_pa_with_unknown_fips_returns_county_not_configured(self):
+    def test_pa_with_unknown_fips_returns_county_not_configured(self, real_layer_maps):
+        sl, cl = real_layer_maps
         result = lookup_parcel(
             "KEY5", "PA", lat=40.0, lon=-75.0,
             county_fips="99999", session=_FAKE_SESSION,
+            state_layers=sl, county_layers=cl,
         )
         assert result.lookup_status == "county_not_configured"
 
 
 class TestLookupParcelNotFound:
-    def test_empty_feature_list_returns_not_found(self):
+    def test_empty_feature_list_returns_not_found(self, real_layer_maps):
+        sl, cl = real_layer_maps
         with patch(_PATCH_TARGET, return_value=[]):
             result = lookup_parcel(
                 "KEY6", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
         assert result.lookup_status == "not_found"
 
-    def test_not_found_note_mentions_envelope_fallback(self):
+    def test_not_found_note_mentions_envelope_fallback(self, real_layer_maps):
+        sl, cl = real_layer_maps
         with patch(_PATCH_TARGET, return_value=[]):
             result = lookup_parcel(
                 "KEY6", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
         assert "envelope" in result.lookup_note.lower()
 
 
 class TestLookupParcelNoAreaField:
-    def test_feature_with_null_area_field_returns_no_area_field(self, fl_feature):
+    def test_feature_with_null_area_field_returns_no_area_field(self, fl_feature, real_layer_maps):
         # Set area to None so float() coercion gives None → area_found stays False.
         fl_feature["properties"]["LND_SQFOOT"] = None
+        sl, cl = real_layer_maps
 
         with patch(_PATCH_TARGET, return_value=[fl_feature]):
             result = lookup_parcel(
                 "KEY7", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
         assert result.lookup_status == "no_area_field"
 
-    def test_feature_with_zero_area_returns_no_area_field(self, fl_feature):
+    def test_feature_with_zero_area_returns_no_area_field(self, fl_feature, real_layer_maps):
         fl_feature["properties"]["LND_SQFOOT"] = 0
+        sl, cl = real_layer_maps
 
         with patch(_PATCH_TARGET, return_value=[fl_feature]):
             result = lookup_parcel(
                 "KEY7", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
         assert result.lookup_status == "no_area_field"
 
-    def test_no_area_field_still_populates_parcel_count(self, fl_feature):
+    def test_no_area_field_still_populates_parcel_count(self, fl_feature, real_layer_maps):
         fl_feature["properties"]["LND_SQFOOT"] = None
+        sl, cl = real_layer_maps
 
         with patch(_PATCH_TARGET, return_value=[fl_feature]):
             result = lookup_parcel(
                 "KEY7", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
         assert result.parcel_count == 1
 
-    def test_no_area_field_note_mentions_field_name(self, fl_feature):
+    def test_no_area_field_note_mentions_field_name(self, fl_feature, real_layer_maps):
         fl_feature["properties"]["LND_SQFOOT"] = None
+        sl, cl = real_layer_maps
 
         with patch(_PATCH_TARGET, return_value=[fl_feature]):
             result = lookup_parcel(
                 "KEY7", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
         assert "LND_SQFOOT" in result.lookup_note
 
 
 class TestLookupParcelOk:
-    def test_single_parcel_fl_sqft_converted_to_acres(self, fl_feature):
+    def test_single_parcel_fl_sqft_converted_to_acres(self, fl_feature, real_layer_maps):
         # 87120 sq ft / 43560 == exactly 2.0 acres.
+        sl, cl = real_layer_maps
         with patch(_PATCH_TARGET, return_value=[fl_feature]):
             result = lookup_parcel(
                 "KEY8", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
         assert result.lookup_status == "ok"
         assert result.maintained_acres == pytest.approx(2.0, rel=1e-4)
 
-    def test_single_parcel_has_parcel_count_one(self, fl_feature):
+    def test_single_parcel_has_parcel_count_one(self, fl_feature, real_layer_maps):
+        sl, cl = real_layer_maps
         with patch(_PATCH_TARGET, return_value=[fl_feature]):
             result = lookup_parcel(
                 "KEY8", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
         assert result.parcel_count == 1
 
-    def test_single_parcel_parcel_id_populated(self, fl_feature):
+    def test_single_parcel_parcel_id_populated(self, fl_feature, real_layer_maps):
+        sl, cl = real_layer_maps
         with patch(_PATCH_TARGET, return_value=[fl_feature]):
             result = lookup_parcel(
                 "KEY8", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
         assert result.parcel_id == "08-1234-567-0001"
 
-    def test_single_parcel_owner_name_populated(self, fl_feature):
+    def test_single_parcel_owner_name_populated(self, fl_feature, real_layer_maps):
+        sl, cl = real_layer_maps
         with patch(_PATCH_TARGET, return_value=[fl_feature]):
             result = lookup_parcel(
                 "KEY8", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
         assert result.owner_name is not None
         assert "GENERAL HOSPITAL" in result.owner_name
 
-    def test_single_parcel_boundary_geojson_set(self, fl_feature):
+    def test_single_parcel_boundary_geojson_set(self, fl_feature, real_layer_maps):
+        sl, cl = real_layer_maps
         with patch(_PATCH_TARGET, return_value=[fl_feature]):
             result = lookup_parcel(
                 "KEY8", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
         assert result.boundary_geojson is not None
 
-    def test_natural_key_preserved_in_result(self, fl_feature):
+    def test_natural_key_preserved_in_result(self, fl_feature, real_layer_maps):
+        sl, cl = real_layer_maps
         with patch(_PATCH_TARGET, return_value=[fl_feature]):
             result = lookup_parcel(
                 "HOSPITAL_001", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
         assert result.natural_key == "HOSPITAL_001"
 
 
 class TestLookupParcelOkMultiParcel:
-    def test_two_parcels_returns_ok_multi_parcel_status(self, fl_feature):
+    def test_two_parcels_returns_ok_multi_parcel_status(self, fl_feature, real_layer_maps):
         import copy
+        sl, cl = real_layer_maps
         feature2 = copy.deepcopy(fl_feature)
         feature2["properties"]["PARCELNO"] = "08-1234-567-0002"
         feature2["properties"]["LND_SQFOOT"] = 43560  # 1.0 acre
@@ -370,12 +429,14 @@ class TestLookupParcelOkMultiParcel:
             result = lookup_parcel(
                 "KEY9", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
         assert result.lookup_status == "ok_multi_parcel"
 
-    def test_two_parcels_acres_are_summed(self, fl_feature):
+    def test_two_parcels_acres_are_summed(self, fl_feature, real_layer_maps):
         import copy
+        sl, cl = real_layer_maps
         feature2 = copy.deepcopy(fl_feature)
         feature2["properties"]["LND_SQFOOT"] = 43560  # 1.0 acre
 
@@ -383,13 +444,15 @@ class TestLookupParcelOkMultiParcel:
             result = lookup_parcel(
                 "KEY9", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
         # 2.0 + 1.0 == 3.0 acres.
         assert result.maintained_acres == pytest.approx(3.0, rel=1e-4)
 
-    def test_two_parcels_parcel_count_is_two(self, fl_feature):
+    def test_two_parcels_parcel_count_is_two(self, fl_feature, real_layer_maps):
         import copy
+        sl, cl = real_layer_maps
         feature2 = copy.deepcopy(fl_feature)
         feature2["properties"]["LND_SQFOOT"] = 43560
 
@@ -397,13 +460,15 @@ class TestLookupParcelOkMultiParcel:
             result = lookup_parcel(
                 "KEY9", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
         assert result.parcel_count == 2
 
-    def test_two_parcels_boundary_is_geometry_collection(self, fl_feature):
+    def test_two_parcels_boundary_is_geometry_collection(self, fl_feature, real_layer_maps):
         import copy
         import json
+        sl, cl = real_layer_maps
         feature2 = copy.deepcopy(fl_feature)
         feature2["properties"]["LND_SQFOOT"] = 43560
 
@@ -411,6 +476,7 @@ class TestLookupParcelOkMultiParcel:
             result = lookup_parcel(
                 "KEY9", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
         geom = json.loads(result.boundary_geojson)
@@ -419,31 +485,62 @@ class TestLookupParcelOkMultiParcel:
 
 
 class TestLookupParcelError:
-    def test_exception_in_spatial_lookup_returns_error_status(self):
-        with patch(_PATCH_TARGET, side_effect=Exception("Connection refused")):
+    def test_network_error_in_spatial_lookup_returns_error_status(self, real_layer_maps):
+        sl, cl = real_layer_maps
+        with patch(_PATCH_TARGET, side_effect=requests.ConnectionError("Connection refused")):
             result = lookup_parcel(
                 "KEY10", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
         assert result.lookup_status == "error"
 
-    def test_exception_message_appears_in_note(self):
-        with patch(_PATCH_TARGET, side_effect=Exception("Connection refused")):
+    def test_network_error_message_appears_in_note(self, real_layer_maps):
+        sl, cl = real_layer_maps
+        with patch(_PATCH_TARGET, side_effect=requests.ConnectionError("Connection refused")):
             result = lookup_parcel(
                 "KEY10", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
+        # Note format is "network: <exc>" for RequestException subtypes.
         assert "Connection refused" in result.lookup_note
+        assert result.lookup_note.startswith("network:")
 
-    def test_http_error_caught_and_returns_error_status(self):
-        import requests
+    def test_http_error_caught_and_returns_error_status(self, real_layer_maps):
+        sl, cl = real_layer_maps
         with patch(_PATCH_TARGET, side_effect=requests.HTTPError("503 Service Unavailable")):
             result = lookup_parcel(
                 "KEY10", "FL", lat=_FL_LAT, lon=_FL_LON,
                 county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
             )
 
         assert result.lookup_status == "error"
         assert "503" in result.lookup_note
+
+    def test_parse_error_key_error_returns_error_status(self, real_layer_maps):
+        # KeyError from malformed response data should be caught, not propagate.
+        sl, cl = real_layer_maps
+        with patch(_PATCH_TARGET, side_effect=KeyError("features")):
+            result = lookup_parcel(
+                "KEY10", "FL", lat=_FL_LAT, lon=_FL_LON,
+                county_fips=None, session=_FAKE_SESSION,
+                state_layers=sl, county_layers=cl,
+            )
+
+        assert result.lookup_status == "error"
+        assert result.lookup_note.startswith("parse:")
+
+    def test_programming_error_propagates(self, real_layer_maps):
+        # Bare Exception (e.g. a TypeError from a config bug) must NOT be swallowed.
+        sl, cl = real_layer_maps
+        with pytest.raises(TypeError):
+            with patch(_PATCH_TARGET, side_effect=TypeError("unexpected type")):
+                lookup_parcel(
+                    "KEY10", "FL", lat=_FL_LAT, lon=_FL_LON,
+                    county_fips=None, session=_FAKE_SESSION,
+                    state_layers=sl, county_layers=cl,
+                )

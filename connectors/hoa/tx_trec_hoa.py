@@ -43,6 +43,8 @@ import sys
 
 import pandas as pd
 
+from lib.normalize import normalize_name, normalize_zip
+
 SOURCE_ID = "tx_trec_hoa"
 VERTICAL = "hoa"
 
@@ -89,25 +91,14 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     df["association_id"] = ids["association_id"]
     df["certificate_id"] = ids["certificate_id"]
 
-    # TODO: migrate to lib/normalize.normalize_name
-    df["name_normalized"] = (
-        df["Name"].str.upper()
-        .str.replace(r"[^A-Z0-9 ]", " ", regex=True)
-        .str.replace(r"\b(INC|LLC|LTD|CORP|CO)\b", " ", regex=True)
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
+    df["name_normalized"] = df["Name"].map(normalize_name)
 
-    df["city_normalized"] = (
-        df["City"].str.upper().str.replace(r"\s+", " ", regex=True).str.strip()
-    )
+    df["city_normalized"] = df["City"].map(normalize_name)
 
     # 99.5% yield. The 79 failures hold junk like "TX", "Travis", "2008".
     # Kept as a string throughout — a float round-trip turns 78133 into 78133.0
     # and silently destroys any leading zero.
-    # TODO: migrate to lib/normalize.normalize_zip
-    z = df["Zip"].str.replace(r"\D", "", regex=True)
-    df["zip5"] = z.where(z.str.len() >= 5).str[:5].fillna("").astype(str)
+    df["zip5"] = df["Zip"].map(normalize_zip)
 
     county_raw = df["County"].str.upper().str.strip()
     df["county_source"] = county_raw
@@ -231,20 +222,24 @@ def build_pdf_queue(df: pd.DataFrame) -> pd.DataFrame:
 def assert_source_shape(df: pd.DataFrame) -> None:
     expected = {"Name", "County", "City", "Zip", "Type", "Certificate"}
     missing = expected - set(df.columns)
-    assert not missing, f"missing column(s) {missing} — Socrata layout changed"
+    if missing:
+        raise ValueError(f"missing column(s) {missing} — Socrata layout changed")
 
     for col in ("Name", "Type", "Certificate"):
         fill = (df[col].str.strip() != "").mean()
-        assert fill > 0.99, f"{col} only {fill:.1%} populated"
+        if not fill > 0.99:
+            raise ValueError(f"{col} only {fill:.1%} populated")
 
     parsed = df["Certificate"].str.extract(CERT_URL_RE)["association_id"].notna().mean()
-    assert parsed > 0.98, (
-        f"only {parsed:.1%} of certificate URLs match the expected "
-        "/certificates/{id}/{cert}/mc/ shape — URL scheme changed"
-    )
+    if not parsed > 0.98:
+        raise ValueError(
+            f"only {parsed:.1%} of certificate URLs match the expected "
+            "/certificates/{id}/{cert}/mc/ shape — URL scheme changed"
+        )
 
     unknown = set(df["Type"].str.upper().unique()) - set(TYPE_MAP)
-    assert not unknown, f"unmapped Type value(s): {unknown}"
+    if unknown:
+        raise ValueError(f"unmapped Type value(s): {unknown}")
 
 
 # ---------------------------------------------------------------- entrypoint

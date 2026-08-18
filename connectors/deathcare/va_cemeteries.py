@@ -1,0 +1,247 @@
+"""
+VA National Cemetery Sites — Socrata CSV export.
+
+Source  : https://datahub.va.gov/api/views/fcxt-zc8r/rows.csv?accessType=DOWNLOAD
+Format  : CSV, ~170 records, refreshed periodically by the VA.
+License : Public domain — U.S. Department of Veterans Affairs open data.
+
+Verified field names and record counts from live API on 2026-08-18:
+  cemetery_name — cemetery name (always populated)
+  state         — FULL state name ("Alabama"), NOT 2-letter abbreviation
+  address       — PACKED: "Street, City, ST ZIPCODE" in one string
+  latitude      — decimal degrees WGS84 (float as string)
+  longitude     — decimal degrees WGS84 (float as string)
+  contact       — PACKED: "Phone: NNN-NNN-NNNN, FAX: ..." in one string
+  burial_space  — "Open", "Closed", or "Cremation Only"
+
+No dedicated ID field exists in the CSV export. Natural key:
+  cemetery_name + '|' + state (state as full name — stable).
+
+All 170 records are federal sites managed by the National Cemetery
+Administration. None qualify as commercial leads; segment='federal' is
+set here to exclude them at the merge layer without a separate filter pass.
+"""
+
+from __future__ import annotations
+
+import io
+import re
+import sys
+
+import pandas as pd
+import requests
+
+from lib.geo import STATE_NAME_TO_ABBR
+from lib.normalize import normalize_name, normalize_phone, normalize_zip
+from lib.schema import build_canonical
+from lib.validate import assert_columns_present, assert_min_rows
+
+# ---------------------------------------------------------------- constants
+
+SOURCE_URL = "https://datahub.va.gov/api/views/fcxt-zc8r/rows.csv?accessType=DOWNLOAD"
+
+_MIN_EXPECTED_ROWS = 150
+
+_REQUIRED_COLUMNS = [
+    "cemetery_name",
+    "state",
+    "address",
+    "latitude",
+    "longitude",
+    "contact",
+]
+
+_TARGET_STATES = ("FL", "TX", "NC", "SC", "PA")
+
+# Packed-field regexes — compiled once at module load.
+_RE_ZIP = re.compile(r"(\d{5})$")
+_RE_STATE_ABBR = re.compile(r"\b([A-Z]{2})\s+\d{5}$")
+# First phone number before a comma, "Or" alternate, or end of string.
+_RE_PHONE = re.compile(r"Phone:\s*([\d\-\(\) ]+?)(?:,|\s+Or\s+|$)", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------- helpers
+
+def _extract_zip(address: str | None) -> str:
+    """Return 5-digit ZIP from a packed address string, or ''."""
+    if not address:
+        return ""
+    m = _RE_ZIP.search(address.strip())
+    return m.group(1) if m else ""
+
+
+def _extract_state_abbr_from_address(address: str | None) -> str:
+    """Return 2-letter state abbreviation from a packed address string, or ''."""
+    if not address:
+        return ""
+    m = _RE_STATE_ABBR.search(address.strip())
+    return m.group(1) if m else ""
+
+
+def _extract_city(address: str | None) -> str:
+    """
+    Return city from a packed "Street, City, ST ZIPCODE" string.
+
+    City is the segment immediately before the "ST ZIPCODE" token.
+    Splitting on comma and taking the second-to-last part is robust to
+    streets that themselves contain commas.
+    """
+    if not address:
+        return ""
+    # Drop the trailing "ST ZIPCODE" suffix before splitting.
+    # Everything up to and including the 2-letter state + ZIP is removed.
+    stripped = _RE_STATE_ABBR.sub("", address.strip()).rstrip(" ,")
+    parts = [p.strip() for p in stripped.split(",")]
+    return parts[-1] if parts else ""
+
+
+def _extract_street(address: str | None) -> str:
+    """
+    Return street portion from a packed "Street, City, ST ZIPCODE" string.
+
+    Street is everything before the city segment — i.e., all comma-delimited
+    parts except the last one (city) after the state+ZIP suffix is stripped.
+    """
+    if not address:
+        return ""
+    stripped = _RE_STATE_ABBR.sub("", address.strip()).rstrip(" ,")
+    parts = [p.strip() for p in stripped.split(",")]
+    if len(parts) <= 1:
+        return parts[0] if parts else ""
+    return ", ".join(parts[:-1])
+
+
+def _extract_phone(contact: str | None) -> str:
+    """Return first phone number string from a packed contact field, or ''."""
+    if not contact:
+        return ""
+    m = _RE_PHONE.search(contact)
+    return m.group(1).strip() if m else ""
+
+
+# ---------------------------------------------------------------- extract
+
+def load_raw(path_or_url: str | None = None) -> pd.DataFrame:
+    """
+    Download the VA National Cemetery CSV and return a raw DataFrame.
+
+    ``path_or_url`` defaults to the Socrata download URL. Pass a local file
+    path to load a cached copy without a network call (used in tests).
+
+    All columns are read as strings to prevent pandas from coercing ZIP codes
+    or phone fragments into floats.
+    """
+    source = path_or_url or SOURCE_URL
+
+    if source.startswith("http"):
+        response = requests.get(source, timeout=60)
+        response.raise_for_status()
+        text = response.text
+        df = pd.read_csv(io.StringIO(text), dtype=str)
+    else:
+        df = pd.read_csv(source, dtype=str)
+
+    df["source_file"] = SOURCE_URL
+    return df
+
+
+# ---------------------------------------------------------------- checks
+
+def assert_source_shape(df: pd.DataFrame) -> None:
+    """
+    Raise ValueError if the loaded data does not match the known source shape.
+
+    Guards against: Socrata layout changes, truncated downloads, and encoding
+    issues that would corrupt full-name state values.
+    """
+    assert_columns_present(df, _REQUIRED_COLUMNS, label="va_cemeteries")
+    assert_min_rows(df, _MIN_EXPECTED_ROWS, label="va_cemeteries")
+
+    known_names = set(STATE_NAME_TO_ABBR.keys())
+    actual_names = set(df["state"].dropna().unique())
+    unknown = actual_names - known_names
+    if unknown:
+        raise ValueError(
+            f"va_cemeteries: unrecognized state full-names: {sorted(unknown)}. "
+            "Update STATE_NAME_TO_ABBR in lib/geo.py or check for encoding issues in the source."
+        )
+
+
+# ---------------------------------------------------------------- transform
+
+def normalize(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add derived columns used by to_canonical() and the deathcare merge module.
+
+    Packed fields (address, contact) are parsed here so that to_canonical()
+    can map individual columns without any parsing logic.
+    """
+    df = df.copy()
+
+    df["name_normalized"] = df["cemetery_name"].map(normalize_name)
+
+    df["address_line_1"] = df["address"].map(_extract_street)
+    df["city"] = df["address"].map(_extract_city)
+    df["state_abbr"] = df["address"].map(_extract_state_abbr_from_address)
+    df["zip5"] = df["address"].map(_extract_zip).map(normalize_zip)
+
+    df["phone_raw"] = df["contact"].map(_extract_phone)
+    df["phone_normalized"] = df["phone_raw"].map(normalize_phone)
+
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+
+    df["segment"] = "federal"
+    df["county_fips"] = None
+    df["ein"] = None
+
+    return df
+
+
+# ---------------------------------------------------------------- quality
+
+def report_quality(df: pd.DataFrame) -> None:
+    """Log data quality metrics to stderr."""
+    total = len(df)
+    sys.stderr.write(f"  va_cemeteries: {total:,} total records\n")
+
+    sys.stderr.write("  va_cemeteries: target-state rows\n")
+    for abbr in _TARGET_STATES:
+        count = (df["state_abbr"] == abbr).sum()
+        sys.stderr.write(f"    {abbr}  {count:>5,}\n")
+
+    sys.stderr.write("  va_cemeteries: burial_space breakdown\n")
+    if "burial_space" in df.columns:
+        for val, count in df["burial_space"].value_counts(dropna=False).items():
+            sys.stderr.write(f"    {val}  {count:>5,}\n")
+
+    parseable_phone = df["phone_normalized"].str.len().gt(0).mean()
+    sys.stderr.write(f"  va_cemeteries: parseable phone  {parseable_phone:.1%}\n")
+
+
+# ---------------------------------------------------------------- canonical output
+
+def to_canonical(df: pd.DataFrame) -> pd.DataFrame:
+    """Map normalized VA cemetery columns to the standard deathcare output shape."""
+    natural_key = df["cemetery_name"] + "|" + df["state"]
+    source_id = "va:" + df["name_normalized"] + "|" + df["state_abbr"]
+
+    return build_canonical(
+        df.index,
+        source_id=source_id,
+        natural_key=natural_key,
+        vertical="deathcare",
+        account_type="federal",
+        name_raw=df["cemetery_name"],
+        name_normalized=df["name_normalized"],
+        address_line_1=df["address_line_1"],
+        city=df["city"],
+        state=df["state_abbr"],
+        zip5=df["zip5"],
+        phone_raw=df["phone_raw"],
+        phone_normalized=df["phone_normalized"],
+        latitude=df["latitude"],
+        longitude=df["longitude"],
+        segment="federal",
+        source_file=df["source_file"],
+    )
