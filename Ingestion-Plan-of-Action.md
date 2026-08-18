@@ -248,6 +248,7 @@ Field-level, not record-level. For each canonical field, take the value from the
 | Legal name | Corporate registry → state regulator → federal file |
 | Officers / agents | Corporate registry (only source) |
 | Bed / unit count | State licensing (PA DOH, FL DBPR) → CMS POS → CMS Care Compare |
+| Lot acreage | County parcel recorded area → building-footprint-subtracted estimate → size-band derived from bed count |
 | Status (active/dissolved) | Corporate registry → regulator |
 
 Two hard rules. **Never overwrite a human edit** — add a `manually_verified` boolean on both account and contact, and have survivorship skip those fields permanently. **Never hard-delete.** If a record disappears from a source, set `last_seen` and let a view mark it stale; a dissolved HOA is still a lead worth understanding.
@@ -283,7 +284,78 @@ Licensing note applied throughout: every source below is either US federal publi
 - **SC:** DPH — note DHEC split effective 2024-07-01, licensing went to DPH. `dph.sc.gov/professionals/healthcare-quality/licensed-facilities-professionals` — "Find a Facility" with Export All to CSV per type.
 - **TX (weakest):** HHSC web search UIs only; DSHS bed data is **PDF only**. Lean on CMS here and budget a public-information request.
 
-**Size proxy:** bed count is available and is your best ready-made signal. No source carries acreage. **Derive it:** geocode the facility, join to county parcel polygons, subtract building footprints, compute residual landscapable area. That converts a bed count into estimated mowable acres and is the one part of this nobody else prospecting these accounts will have.
+**Size proxy:** bed count is your best ready-made signal. No CMS or NPPES source carries acreage. Derive it from county parcel layers via §6.1.2 below — it converts a bed count into estimated mowable acres, which no competitor prospecting these accounts will have.
+
+#### 6.1.2 ArcGIS parcel extraction for healthcare acreage
+
+**Goal:** for each hospital location, find the parcel(s) it sits on, pull the recorded lot area, and write it to `location.maintained_acres` with `acres_confidence = 'estimated'`.
+
+**State parcel sources — all free ArcGIS FeatureServices:**
+
+| State | Layer / Source | FeatureServer URL | Key area field |
+|---|---|---|---|
+| **FL** | Florida Statewide Cadastral (DOR, all 67 counties) | `services9.arcgis.com/Gh9awoU677aKree0/arcgis/rest/services/Florida_Statewide_Cadastral/FeatureServer/0` | `LND_SQFOOT` (÷ 43,560 → acres) |
+| **NC** | NC OneMap Statewide Parcels (weekly refresh) | `services.nconemap.gov/secure/rest/services/NC1Map_Cadastral/FeatureServer/0` | `CALC_ACRES` |
+| **TX** | County CAD layers via TxGIO hub (no statewide layer) | `txgio.texas.gov` — route by county FIPS; cap at top 15 metro counties (~80% of TX hospitals) | `LAND_ACRES` or `LEGAL_ACRES` (field name varies by county CAD) |
+| **PA** | PASDA county-by-county (no statewide layer) | `pasda.psu.edu` county REST endpoints; start with Philadelphia, Allegheny, Montgomery, Bucks, Delaware | `SHAPE_Area` (sq ft, convert) or `LOTSIZE` |
+| **SC** | County assessor bulk files (no statewide ArcGIS layer) | Pull per-county from county GIS portals; Charleston, Greenville, Richland cover most healthcare leads | `ACREAGE` or `CALC_ACREAGE` |
+
+**Query pattern** (same FeatureServer loop used by the Hub harvester in §6.4):
+
+```python
+# Spatial lookup: find the parcel whose polygon contains the hospital point
+params = {
+    "geometry": f"{lon},{lat}",
+    "geometryType": "esriGeometryPoint",
+    "spatialRel": "esriSpatialRelIntersects",
+    "inSR": "4326",
+    "outFields": "PARCEL_ID,LND_SQFOOT,SHAPE_Area,OWN_NAME",
+    "returnGeometry": "true",   # keep polygon → location.boundary
+    "outSR": "4326",
+    "f": "geojson",
+}
+# If point returns 0 results (geocode on road edge), fall back to 50m envelope:
+# geometryType = esriGeometryEnvelope, geometry = f"{lon-0.0005},{lat-0.0005},{lon+0.0005},{lat+0.0005}"
+```
+
+**PostGIS workflow** (runs as Stage 3 enrichment after healthcare staging is complete):
+
+```sql
+-- Single-parcel case
+UPDATE core.location l
+SET maintained_acres = p.lnd_sqfoot / 43560.0,
+    acres_confidence = 'estimated',
+    boundary         = p.geom,
+    geometry_source  = 'parcel'
+FROM staging.parcel_fl p
+WHERE ST_Contains(p.geom, l.geom)
+  AND l.vertical = 'healthcare' AND l.state = 'FL';
+
+-- Multi-parcel campus: sum area, union geometry
+WITH campus AS (
+  SELECT l.location_id,
+         SUM(p.lnd_sqfoot) / 43560.0 AS total_acres,
+         ST_Union(p.geom)             AS campus_boundary
+  FROM core.location l
+  JOIN staging.parcel_fl p ON ST_Intersects(p.geom, l.geom)
+  WHERE l.vertical = 'healthcare' AND l.state = 'FL'
+  GROUP BY l.location_id
+  HAVING COUNT(*) > 1
+)
+UPDATE core.location l
+SET maintained_acres = c.total_acres,
+    boundary         = c.campus_boundary,
+    acres_confidence = 'estimated',
+    geometry_source  = 'parcel'
+FROM campus c WHERE l.location_id = c.location_id;
+```
+
+**Connector placement:** implement as `connectors/parcel_acreage_enrich.py`, separate from the CMS connectors. It runs after `core.location` is populated for healthcare and can be re-run independently when parcel layers refresh.
+
+**Known limitations (document in code):**
+- Parcel area = total recorded lot, not net landscapable area. Building footprint subtraction is a future enhancement; set `acres_confidence = 'estimated'` until then.
+- TX and PA have no statewide layer — route by `location.county_fips` to the correct county endpoint.
+- SC has no ArcGIS layer — first pass is manual county assessor CSV download; automate once the pattern is proven.
 
 **Ruled out:** HIFLD Open (shut down 2025-08-26; DataLumos archive is frozen and CMS supersedes it). The NASA-hosted HIFLD mirror has no SLA — do not depend on it.
 
