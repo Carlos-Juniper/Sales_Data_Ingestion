@@ -27,35 +27,15 @@ from collections.abc import Generator
 from typing import Any
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+
+from lib.http import make_session
 
 _QUERY_PATH = "/query"
 _DEFAULT_TIMEOUT = 30
-_DEFAULT_RETRIES = 3
-_DEFAULT_BACKOFF = 1.5
 
 # Degrees per meter at the equator. Good enough for a 50m parcel-boundary buffer
 # across the five target states (FL, NC, TX, PA, SC — all below 50°N).
 _DEG_PER_METER = 1.0 / 111_320.0
-
-
-def make_session(
-    retries: int = _DEFAULT_RETRIES,
-    backoff: float = _DEFAULT_BACKOFF,
-) -> requests.Session:
-    """Return a Session with retry logic wired up for both http and https."""
-    session = requests.Session()
-    retry = Retry(
-        total=retries,
-        backoff_factor=backoff,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
 
 
 def get_layer_info(

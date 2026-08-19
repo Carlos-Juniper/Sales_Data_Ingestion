@@ -1,0 +1,11 @@
+# CMS Provider Data API — dataset registry
+# Keys are CLI names; values are dataset UUIDs from data.cms.gov/provider-data
+nursing_home:
+  dataset_id: 4pq5-n9py
+  output_file: nh_provider_data.csv
+  description: "Nursing Home Compare — Provider Information"
+
+general:
+  dataset_id: xubh-q36u
+  output_file: hospital_provider_data.csv
+  description: "Hospital Compare — General Information"
