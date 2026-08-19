@@ -1,9 +1,9 @@
 """
 Shared pytest fixtures for the parcel connector test suite.
 
-Fixtures here are consumed by test_normalize.py, test_arcgis.py, and
-test_parcel_enrich.py.  Everything in this file is pure in-memory data;
-no network or filesystem side-effects occur during setup.
+Fixtures here are consumed by test_parcel_enrich.py. Everything in this file
+is pure in-memory data; no network or filesystem side-effects occur during
+setup.
 """
 
 import os

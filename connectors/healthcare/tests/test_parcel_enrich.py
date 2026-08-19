@@ -11,10 +11,17 @@ real_layer_maps fixture (built once from the on-disk YAML) or pass maps derived
 from the minimal_yaml fixture directly to lookup_parcel.
 """
 
+
+import os
+import sys
 from unittest.mock import patch
 
 import pytest
 import requests
+
+# Make the connector module importable when pytest is run from the repo root
+# or from inside connectors/.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import parcel_acreage_enrich as pe
 from parcel_acreage_enrich import (

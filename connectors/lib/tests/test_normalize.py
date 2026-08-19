@@ -6,7 +6,14 @@ Tests are organized by function, with parametrize used for the many
 equivalent suffix/format cases to keep the file scannable.
 """
 
+import os
+import sys
+
 import pytest
+
+# Make the connectors package importable when pytest is run from the repo root
+# or from inside connectors/.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from lib.normalize import normalize_name, normalize_phone, normalize_zip
 

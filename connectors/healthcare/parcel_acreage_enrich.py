@@ -76,6 +76,9 @@ import pandas as pd
 import requests
 import yaml
 
+# connectors/lib is a shared package one level up from this vertical folder.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from lib.arcgis import make_session, spatial_point_lookup
 from lib.enrich_runner import run_enrichment
 from lib.normalize import normalize_name

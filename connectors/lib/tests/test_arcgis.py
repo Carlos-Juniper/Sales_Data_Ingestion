@@ -10,10 +10,16 @@ a Session instance — patching at the class level intercepts every call
 regardless of how/when the Session is instantiated inside the module.
 """
 
+import os
+import sys
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 import requests
+
+# Make the connectors package importable when pytest is run from the repo root
+# or from inside connectors/.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from lib.arcgis import get_layer_info, iter_features, spatial_point_lookup
 
