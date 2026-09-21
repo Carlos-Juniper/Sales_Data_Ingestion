@@ -16,20 +16,31 @@
 # State coverage notes
 # --------------------
 #   FL  — Florida Statewide Cadastral (DOR, all 67 counties), area field LND_SQFOOT (sq ft)
-#   NC  — NC OneMap Statewide Parcels (weekly refresh), area field CALC_ACRES
-#   TX  — No statewide layer; routes by county_fips to county CAD FeatureServices.
-#          Top-15 metro counties cover ~80% of TX hospital locations. Add county URLs
-#          to the TX section to expand coverage.
-#   PA  — No statewide layer; routes by county_fips to PASDA county endpoints.
-#          Top-10 metro counties cover ~75% of PA hospital locations. Add county URLs
-#          to the PA section to expand coverage.
+#   NC  — NC OneMap Statewide Parcels. The /secure/ endpoint returns "Token Required";
+#          it needs an NC OneMap credential we do not hold. NC rows currently yield
+#          lookup_status=error until a token is configured or a public layer is found.
+#   TX  — No *public* statewide layer. The official TxGIO StratMap statewide parcel
+#          service (feature.geographic.texas.gov .../stratmap23_land_parcels_48) also
+#          returns "Token Required". All 15 county CAD URLs previously listed here were
+#          probed on 2026-09-21 and every one failed (DNS failure, 403, 404, or TLS
+#          error). They are commented out below rather than deleted — a dead URL costs
+#          a full HTTP timeout on every row, whereas an absent county short-circuits
+#          to county_not_configured immediately.
+#   PA  — No statewide layer. 9 of the 10 county URLs previously listed here failed the
+#          same probe. Montgomery (42091) is the one verified working source and is the
+#          only live county entry below.
 #   SC  — No ArcGIS layer available. Pull county assessor CSVs manually for the first
 #          pass; the connector emits state_not_supported for SC rows.
 #
-# To add a TX county:
-#   1. Find its FeatureServer at https://txgio.texas.gov or the county CAD's own GIS portal.
-#   2. Confirm the layer has an area field and a parcel ID field.
-#   3. Add an entry under county.TX keyed by 5-digit FIPS.
+# To add a county, all four steps must pass — step 3 is where most candidates die:
+#   1. Find its FeatureServer (county CAD/GIS portal, or search arcgis.com).
+#   2. Confirm GET <url>?f=json returns a layer (not "Token Required" / 404 / 403).
+#   3. Query 5 sample rows and confirm the area field is populated with LOT area.
+#      Verified failures: Travis TCAD SDE_TCAD_PARCELS_AREA is 100% NULL; Dallas
+#      ParcelsJoin DEEDACRES is 0 and its SQFT is building area, not lot area.
+#   4. Do NOT use Shape__Area / SHAPE_Area as area_field. It is in the layer's
+#      projection — on a Web Mercator layer the value is not convertible to acres.
+#      Use a real recorded-area attribute (LAND_ACRES, LND_SQFOOT, CALC_ACRES).
 
 statewide:
   FL:
@@ -48,228 +59,248 @@ statewide:
 
 county:
   TX:
-    # Harris (Houston) — largest county in the state
-    # TODO: validate against live endpoint before first production run
-    "48201":
-      url: "https://gis.harriscountytx.gov/arcgis/rest/services/Parcels/MapServer/0"
-      area_field: LND_SQFOOT
-      area_unit: sqft
-      parcel_id_field: ACCT
-      owner_field: OWNER_NM
-
-    # Dallas
-    # TODO: validate against live endpoint before first production run
-    "48113":
-      url: "https://www.dallascad.org/gis/rest/services/Parcels/FeatureServer/0"
-      area_field: LAND_SQFT
-      area_unit: sqft
-      parcel_id_field: ACCOUNT_NUM
-      owner_field: OWNER1
-
-    # Travis (Austin)
-    # TODO: validate against live endpoint before first production run
-    "48453":
-      url: "https://services.arcgis.com/0L95CJ0VTaxqcmED/arcgis/rest/services/Travis_County_Parcels/FeatureServer/0"
-      area_field: SHAPE_Area
-      area_unit: sqft
-      parcel_id_field: GEO_ID
-      owner_field: OWNER_NAME
-
-    # Bexar (San Antonio)
-    # TODO: validate against live endpoint before first production run
-    "48029":
-      url: "https://services.arcgis.com/g1fRTDLeMgspWrYp/arcgis/rest/services/BexarParcelData/FeatureServer/0"
-      area_field: LAND_ACRES
-      area_unit: acres
-      parcel_id_field: PROP_ID
-      owner_field: OWNER_NAME
-
-    # Collin (Plano/McKinney)
-    # TODO: validate against live endpoint before first production run
-    "48085":
-      url: "https://gis.collincountytx.gov/arcgis/rest/services/CAD/FeatureServer/0"
-      area_field: LAND_SQFT
-      area_unit: sqft
-      parcel_id_field: PROP_ID
-      owner_field: OWNER_NAME
-
-    # Tarrant (Fort Worth)
-    # TODO: validate against live endpoint before first production run
-    "48439":
-      url: "https://arcgis.tarrantcounty.com/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: LAND_SQ_FT
-      area_unit: sqft
-      parcel_id_field: ACCOUNT
-      owner_field: OWNER1
-
-    # Denton
-    # TODO: validate against live endpoint before first production run
-    "48121":
-      url: "https://gis.dentoncounty.gov/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: LAND_SQFT
-      area_unit: sqft
-      parcel_id_field: GEO_ID
-      owner_field: OWNER_NAME
-
-    # Montgomery (north Houston suburbs)
-    # TODO: validate against live endpoint before first production run
-    "48339":
-      url: "https://gis.mcad.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: LAND_SQFT
-      area_unit: sqft
-      parcel_id_field: PROP_ID
-      owner_field: OWNER_NAME
-
-    # Fort Bend (southwest Houston suburbs)
-    # TODO: validate against live endpoint before first production run
-    "48157":
-      url: "https://gis.fbcad.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: LAND_SQFT
-      area_unit: sqft
-      parcel_id_field: PROP_ID
-      owner_field: OWNER_NAME
-
-    # Williamson (Round Rock/Georgetown)
-    # TODO: validate against live endpoint before first production run
-    "48491":
-      url: "https://gis.wcad.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: LAND_SQFT
-      area_unit: sqft
-      parcel_id_field: PROP_ID
-      owner_field: OWNER_NAME
-
-    # Galveston
-    # TODO: validate against live endpoint before first production run
-    "48167":
-      url: "https://gis.galvestoncad.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: LAND_SQFT
-      area_unit: sqft
-      parcel_id_field: PROP_ID
-      owner_field: OWNER_NAME
-
-    # Brazoria (Pearland/Alvin)
-    # TODO: validate against live endpoint before first production run
-    "48039":
-      url: "https://gis.brazoriacad.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: LAND_SQFT
-      area_unit: sqft
-      parcel_id_field: GEO_ID
-      owner_field: OWNER_NAME
-
-    # Hidalgo (McAllen/Rio Grande Valley)
-    # TODO: validate against live endpoint before first production run
-    "48215":
-      url: "https://gis.hidalgocad.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: LAND_SQFT
-      area_unit: sqft
-      parcel_id_field: PROP_ID
-      owner_field: OWNER_NAME
-
-    # El Paso
-    # TODO: validate against live endpoint before first production run
-    "48141":
-      url: "https://gis.epcad.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: LAND_SQFT
-      area_unit: sqft
-      parcel_id_field: ACCOUNT_NUM
-      owner_field: OWNER1
-
-    # Nueces (Corpus Christi)
-    # TODO: validate against live endpoint before first production run
-    "48355":
-      url: "https://gis.nuecescad.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: LAND_SQFT
-      area_unit: sqft
-      parcel_id_field: PROP_ID
-      owner_field: OWNER_NAME
+    # No live entries. Every TX county CAD endpoint probed on 2026-09-21 failed.
+    # See the commented block at the end of this file for the URLs that were tried.
+    {}
 
   PA:
-    # Philadelphia
-    # TODO: validate against live endpoint before first production run
-    "42101":
-      url: "https://services.arcgis.com/fLeGjb7u4uXqeF9q/arcgis/rest/services/Philly_Parcels/FeatureServer/0"
-      area_field: SHAPE_Area
-      area_unit: sqft
-      parcel_id_field: PARCEL_ID
-      owner_field: OWNER1
-
-    # Allegheny (Pittsburgh)
-    # TODO: validate against live endpoint before first production run
-    "42003":
-      url: "https://gis.alleghenycounty.us/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: SHAPE_Area
-      area_unit: sqft
-      parcel_id_field: PIN
-      owner_field: OWNER_NM
-
-    # Montgomery
-    # TODO: validate against live endpoint before first production run
+    # Montgomery — VERIFIED 2026-09-21. LAND_ACRES is populated with real lot
+    # acreages (sampled: 0.1837, 0.3610, 0.1703), so it needs no unit conversion.
     "42091":
-      url: "https://gis.montcopa.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: LOTSIZE
-      area_unit: sqft
-      parcel_id_field: PARCELID
-      owner_field: OWNER
+      url: "https://services1.arcgis.com/kOChldNuKsox8qZD/arcgis/rest/services/Montgomery_County_Parcels/FeatureServer/6"
+      area_field: LAND_ACRES
+      area_unit: acres
+      parcel_id_field: TAXPIN
 
-    # Bucks
-    # TODO: validate against live endpoint before first production run
-    "42017":
-      url: "https://mapviewer.buckscounty.gov/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: SHAPE_Area
-      area_unit: sqft
-      parcel_id_field: PARCEL_ID
-      owner_field: OWNER1
-
-    # Delaware
-    # TODO: validate against live endpoint before first production run
-    "42045":
-      url: "https://gis.co.delaware.pa.us/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: SHAPE_Area
-      area_unit: sqft
-      parcel_id_field: PARCELID
-      owner_field: OWNER
-
-    # Chester
-    # TODO: validate against live endpoint before first production run
-    "42029":
-      url: "https://gis.chesco.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: SHAPE_Area
-      area_unit: sqft
-      parcel_id_field: PARCELID
-      owner_field: OWNER1
-
-    # Lancaster
-    # TODO: validate against live endpoint before first production run
-    "42071":
-      url: "https://gis.lancasterpa.gov/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: SHAPE_Area
-      area_unit: sqft
-      parcel_id_field: PARCELID
-      owner_field: OWNER
-
-    # York
-    # TODO: validate against live endpoint before first production run
-    "42133":
-      url: "https://gis.yorkcountypa.gov/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: SHAPE_Area
-      area_unit: sqft
-      parcel_id_field: PARCELID
-      owner_field: OWNER_NAME
-
-    # Dauphin (Harrisburg)
-    # TODO: validate against live endpoint before first production run
-    "42043":
-      url: "https://gis.dauphincounty.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: SHAPE_Area
-      area_unit: sqft
-      parcel_id_field: PARCELID
-      owner_field: OWNER1
-
-    # Luzerne (Wilkes-Barre)
-    # TODO: validate against live endpoint before first production run
-    "42079":
-      url: "https://gis.luzernecounty.org/arcgis/rest/services/Parcels/FeatureServer/0"
-      area_field: SHAPE_Area
-      area_unit: sqft
-      parcel_id_field: PARCELID
-      owner_field: OWNER
+# --------------------------------------------------------------------------
+# Unreachable entries, retained for reference only (probed 2026-09-21).
+# Re-enable an entry only after it passes all four steps in the header note.
+# --------------------------------------------------------------------------
+# county:
+#   TX:
+#     # Harris (Houston) — largest county in the state
+#     # TODO: validate against live endpoint before first production run
+#     "48201":
+#       url: "https://gis.harriscountytx.gov/arcgis/rest/services/Parcels/MapServer/0"
+#       area_field: LND_SQFOOT
+#       area_unit: sqft
+#       parcel_id_field: ACCT
+#       owner_field: OWNER_NM
+#
+#     # Dallas
+#     # TODO: validate against live endpoint before first production run
+#     "48113":
+#       url: "https://www.dallascad.org/gis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LAND_SQFT
+#       area_unit: sqft
+#       parcel_id_field: ACCOUNT_NUM
+#       owner_field: OWNER1
+#
+#     # Travis (Austin)
+#     # TODO: validate against live endpoint before first production run
+#     "48453":
+#       url: "https://services.arcgis.com/0L95CJ0VTaxqcmED/arcgis/rest/services/Travis_County_Parcels/FeatureServer/0"
+#       area_field: SHAPE_Area
+#       area_unit: sqft
+#       parcel_id_field: GEO_ID
+#       owner_field: OWNER_NAME
+#
+#     # Bexar (San Antonio)
+#     # TODO: validate against live endpoint before first production run
+#     "48029":
+#       url: "https://services.arcgis.com/g1fRTDLeMgspWrYp/arcgis/rest/services/BexarParcelData/FeatureServer/0"
+#       area_field: LAND_ACRES
+#       area_unit: acres
+#       parcel_id_field: PROP_ID
+#       owner_field: OWNER_NAME
+#
+#     # Collin (Plano/McKinney)
+#     # TODO: validate against live endpoint before first production run
+#     "48085":
+#       url: "https://gis.collincountytx.gov/arcgis/rest/services/CAD/FeatureServer/0"
+#       area_field: LAND_SQFT
+#       area_unit: sqft
+#       parcel_id_field: PROP_ID
+#       owner_field: OWNER_NAME
+#
+#     # Tarrant (Fort Worth)
+#     # TODO: validate against live endpoint before first production run
+#     "48439":
+#       url: "https://arcgis.tarrantcounty.com/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LAND_SQ_FT
+#       area_unit: sqft
+#       parcel_id_field: ACCOUNT
+#       owner_field: OWNER1
+#
+#     # Denton
+#     # TODO: validate against live endpoint before first production run
+#     "48121":
+#       url: "https://gis.dentoncounty.gov/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LAND_SQFT
+#       area_unit: sqft
+#       parcel_id_field: GEO_ID
+#       owner_field: OWNER_NAME
+#
+#     # Montgomery (north Houston suburbs)
+#     # TODO: validate against live endpoint before first production run
+#     "48339":
+#       url: "https://gis.mcad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LAND_SQFT
+#       area_unit: sqft
+#       parcel_id_field: PROP_ID
+#       owner_field: OWNER_NAME
+#
+#     # Fort Bend (southwest Houston suburbs)
+#     # TODO: validate against live endpoint before first production run
+#     "48157":
+#       url: "https://gis.fbcad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LAND_SQFT
+#       area_unit: sqft
+#       parcel_id_field: PROP_ID
+#       owner_field: OWNER_NAME
+#
+#     # Williamson (Round Rock/Georgetown)
+#     # TODO: validate against live endpoint before first production run
+#     "48491":
+#       url: "https://gis.wcad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LAND_SQFT
+#       area_unit: sqft
+#       parcel_id_field: PROP_ID
+#       owner_field: OWNER_NAME
+#
+#     # Galveston
+#     # TODO: validate against live endpoint before first production run
+#     "48167":
+#       url: "https://gis.galvestoncad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LAND_SQFT
+#       area_unit: sqft
+#       parcel_id_field: PROP_ID
+#       owner_field: OWNER_NAME
+#
+#     # Brazoria (Pearland/Alvin)
+#     # TODO: validate against live endpoint before first production run
+#     "48039":
+#       url: "https://gis.brazoriacad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LAND_SQFT
+#       area_unit: sqft
+#       parcel_id_field: GEO_ID
+#       owner_field: OWNER_NAME
+#
+#     # Hidalgo (McAllen/Rio Grande Valley)
+#     # TODO: validate against live endpoint before first production run
+#     "48215":
+#       url: "https://gis.hidalgocad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LAND_SQFT
+#       area_unit: sqft
+#       parcel_id_field: PROP_ID
+#       owner_field: OWNER_NAME
+#
+#     # El Paso
+#     # TODO: validate against live endpoint before first production run
+#     "48141":
+#       url: "https://gis.epcad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LAND_SQFT
+#       area_unit: sqft
+#       parcel_id_field: ACCOUNT_NUM
+#       owner_field: OWNER1
+#
+#     # Nueces (Corpus Christi)
+#     # TODO: validate against live endpoint before first production run
+#     "48355":
+#       url: "https://gis.nuecescad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LAND_SQFT
+#       area_unit: sqft
+#       parcel_id_field: PROP_ID
+#       owner_field: OWNER_NAME
+#
+#   PA:
+#     # Philadelphia
+#     # TODO: validate against live endpoint before first production run
+#     "42101":
+#       url: "https://services.arcgis.com/fLeGjb7u4uXqeF9q/arcgis/rest/services/Philly_Parcels/FeatureServer/0"
+#       area_field: SHAPE_Area
+#       area_unit: sqft
+#       parcel_id_field: PARCEL_ID
+#       owner_field: OWNER1
+#
+#     # Allegheny (Pittsburgh)
+#     # TODO: validate against live endpoint before first production run
+#     "42003":
+#       url: "https://gis.alleghenycounty.us/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: SHAPE_Area
+#       area_unit: sqft
+#       parcel_id_field: PIN
+#       owner_field: OWNER_NM
+#
+#     # Montgomery
+#     # TODO: validate against live endpoint before first production run
+#     "42091":
+#       url: "https://gis.montcopa.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: LOTSIZE
+#       area_unit: sqft
+#       parcel_id_field: PARCELID
+#       owner_field: OWNER
+#
+#     # Bucks
+#     # TODO: validate against live endpoint before first production run
+#     "42017":
+#       url: "https://mapviewer.buckscounty.gov/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: SHAPE_Area
+#       area_unit: sqft
+#       parcel_id_field: PARCEL_ID
+#       owner_field: OWNER1
+#
+#     # Delaware
+#     # TODO: validate against live endpoint before first production run
+#     "42045":
+#       url: "https://gis.co.delaware.pa.us/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: SHAPE_Area
+#       area_unit: sqft
+#       parcel_id_field: PARCELID
+#       owner_field: OWNER
+#
+#     # Chester
+#     # TODO: validate against live endpoint before first production run
+#     "42029":
+#       url: "https://gis.chesco.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: SHAPE_Area
+#       area_unit: sqft
+#       parcel_id_field: PARCELID
+#       owner_field: OWNER1
+#
+#     # Lancaster
+#     # TODO: validate against live endpoint before first production run
+#     "42071":
+#       url: "https://gis.lancasterpa.gov/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: SHAPE_Area
+#       area_unit: sqft
+#       parcel_id_field: PARCELID
+#       owner_field: OWNER
+#
+#     # York
+#     # TODO: validate against live endpoint before first production run
+#     "42133":
+#       url: "https://gis.yorkcountypa.gov/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: SHAPE_Area
+#       area_unit: sqft
+#       parcel_id_field: PARCELID
+#       owner_field: OWNER_NAME
+#
+#     # Dauphin (Harrisburg)
+#     # TODO: validate against live endpoint before first production run
+#     "42043":
+#       url: "https://gis.dauphincounty.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: SHAPE_Area
+#       area_unit: sqft
+#       parcel_id_field: PARCELID
+#       owner_field: OWNER1
+#
+#     # Luzerne (Wilkes-Barre)
+#     # TODO: validate against live endpoint before first production run
+#     "42079":
+#       url: "https://gis.luzernecounty.org/arcgis/rest/services/Parcels/FeatureServer/0"
+#       area_field: SHAPE_Area
+#       area_unit: sqft
+#       parcel_id_field: PARCELID
+#       owner_field: OWNER
+#

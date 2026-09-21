@@ -58,65 +58,61 @@ def test_assert_config_shape_passes_on_real_yaml(raw_config: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_tx_county_count_meets_target(raw_config: dict) -> None:
-    """TX must have exactly 15 county entries to hit the top-15 metro target."""
-    actual = len(raw_config["county"]["TX"])
-    assert actual == 15, (
-        f"expected 15 TX counties, got {actual} — "
-        "add entries to reach the top-15 metro target (~80% TX hospital coverage)"
+# The registry used to assert that 15 TX and 10 PA counties were *present*.
+# Those assertions passed while every one of the 25 URLs was dead, so they
+# measured intent rather than coverage. Every endpoint was probed on 2026-09-21;
+# the results below are what actually resolves. Re-verify before editing.
+#
+# A county earns an entry only when its area field holds real LOT area:
+#   Travis  SDE_TCAD_PARCELS_AREA — 100% NULL in sampled rows
+#   Dallas  DEEDACRES — 0 in sampled rows; SQFT is building area, not lot area
+KNOWN_COVERAGE_GAPS = {
+    "TX": ["48201", "48113", "48453", "48029", "48085", "48439", "48121",
+           "48339", "48157", "48491", "48167", "48039", "48215", "48141", "48355"],
+    "PA": ["42101", "42003", "42017", "42045", "42029", "42071", "42133", "42043", "42079"],
+}
+
+
+@pytest.mark.parametrize("state", sorted(KNOWN_COVERAGE_GAPS))
+def test_known_coverage_gaps_are_still_absent(raw_config: dict, state: str) -> None:
+    """
+    Pin the counties we know we do NOT cover.
+
+    This fails when someone adds one of them, which is the point: the new entry
+    must be accompanied by removing the FIPS from KNOWN_COVERAGE_GAPS, so the
+    documented gap list can never silently drift from the registry.
+    """
+    configured = set(raw_config["county"].get(state) or {})
+    resolved = sorted(configured & set(KNOWN_COVERAGE_GAPS[state]))
+    assert not resolved, (
+        f"{state} counties {resolved} are now configured but still listed as known "
+        "gaps — verify the endpoint returns real lot area, then drop them from "
+        "KNOWN_COVERAGE_GAPS."
     )
 
 
-def test_pa_county_count_meets_target(raw_config: dict) -> None:
-    """PA must have exactly 10 county entries to hit the top-10 metro target."""
-    actual = len(raw_config["county"]["PA"])
-    assert actual == 10, (
-        f"expected 10 PA counties, got {actual} — "
-        "add entries to reach the top-10 metro target (~75% PA hospital coverage)"
-    )
+def test_montgomery_pa_is_the_verified_county_entry(raw_config: dict) -> None:
+    """Montgomery PA (42091) is the one county endpoint verified to return lot acreage."""
+    entry = (raw_config["county"].get("PA") or {}).get("42091")
+    assert entry is not None, "42091 (Montgomery PA) is the only verified county source"
+    assert entry["area_field"] == "LAND_ACRES"
+    assert entry["area_unit"] == "acres"
 
 
-# ---------------------------------------------------------------------------
-# 5. Required TX counties (4 highest-density)
-# ---------------------------------------------------------------------------
+def test_no_entry_uses_shape_area(raw_config: dict) -> None:
+    """
+    Shape__Area / SHAPE_Area is in the layer's own projection.
 
-
-@pytest.mark.parametrize(
-    "fips,name",
-    [
-        ("48201", "Harris"),
-        ("48113", "Dallas"),
-        ("48453", "Travis"),
-        ("48029", "Bexar"),
-    ],
-)
-def test_required_tx_counties_present(raw_config: dict, fips: str, name: str) -> None:
-    """Each of the 4 highest-density TX counties must be in the registry."""
-    assert fips in raw_config["county"]["TX"], (
-        f"FIPS {fips} ({name} County) is missing from county.TX in parcel_layers.yaml"
-    )
-
-
-# ---------------------------------------------------------------------------
-# 6. Required PA counties (5 highest-density)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "fips,name",
-    [
-        ("42101", "Philadelphia"),
-        ("42003", "Allegheny"),
-        ("42091", "Montgomery"),
-        ("42017", "Bucks"),
-        ("42045", "Delaware"),
-    ],
-)
-def test_required_pa_counties_present(raw_config: dict, fips: str, name: str) -> None:
-    """Each of the 5 highest-density PA counties must be in the registry."""
-    assert fips in raw_config["county"]["PA"], (
-        f"FIPS {fips} ({name} County) is missing from county.PA in parcel_layers.yaml"
-    )
+    On a Web Mercator layer it is not convertible to acres by any fixed factor,
+    so treating it as sqft silently produces wrong acreage rather than an error.
+    Only a recorded-area attribute (LAND_ACRES, LND_SQFOOT, CALC_ACRES) is valid.
+    """
+    offenders = [
+        f"{ctx}:{entry['area_field']}"
+        for ctx, entry in _all_entries(raw_config)
+        if entry.get("area_field", "").replace("_", "").lower() == "shapearea"
+    ]
+    assert not offenders, f"area_field must not be a projected shape area: {offenders}"
 
 
 # ---------------------------------------------------------------------------
