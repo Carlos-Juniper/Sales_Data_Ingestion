@@ -293,3 +293,84 @@ class TestIterFeaturesIdChunkMode:
             result = list(iter_features(BASE_URL))
 
         assert result == []
+
+
+class TestExtraParams:
+    """Server-side geometry reduction, added for the TIGERweb spine.
+
+    TIGERweb serves full-resolution boundaries: 250 counties with geometry is a
+    30 MB response and the service intermittently 500s on it.
+    """
+
+    def _resp(self, features, exceeded=None):
+        resp = MagicMock()
+        payload = {"features": features}
+        if exceeded is not None:
+            payload["exceededTransferLimit"] = exceeded
+        resp.json.return_value = payload
+        resp.raise_for_status.return_value = None
+        return resp
+
+    def test_extra_params_reach_the_query(self):
+        with patch("requests.Session.get", return_value=self._resp([])) as get:
+            list(iter_features(
+                "https://x/FeatureServer/0", max_record_count=10,
+                extra_params={"geometryPrecision": 6, "maxAllowableOffset": 3e-5},
+            ))
+        params = get.call_args.kwargs["params"]
+        assert params["geometryPrecision"] == 6
+        assert params["maxAllowableOffset"] == 3e-5
+
+    @pytest.mark.parametrize(
+        "reserved",
+        ["orderByFields", "resultOffset", "resultRecordCount", "f", "where",
+         "outFields", "returnGeometry", "outSR"],
+    )
+    def test_reserved_keys_are_dropped(self, reserved):
+        """Overriding a pagination parameter would corrupt paging as silently
+        missing or duplicated rows rather than as an error."""
+        with patch("requests.Session.get", return_value=self._resp([])) as get:
+            list(iter_features(
+                "https://x/FeatureServer/0", max_record_count=10,
+                order_by="OBJECTID",
+                extra_params={reserved: "HIJACKED"},
+            ))
+        assert get.call_args.kwargs["params"].get(reserved) != "HIJACKED"
+
+    def test_reserved_key_check_is_case_insensitive(self):
+        with patch("requests.Session.get", return_value=self._resp([])) as get:
+            list(iter_features(
+                "https://x/FeatureServer/0", max_record_count=10,
+                extra_params={"ORDERBYFIELDS": "HIJACKED"},
+            ))
+        assert "HIJACKED" not in str(get.call_args.kwargs["params"])
+
+    def test_dropped_key_is_reported(self, capsys):
+        with patch("requests.Session.get", return_value=self._resp([])):
+            list(iter_features(
+                "https://x/FeatureServer/0", max_record_count=10,
+                extra_params={"resultOffset": 99},
+            ))
+        assert "ignoring reserved extra_params key" in capsys.readouterr().err
+
+    def test_none_and_empty_are_safe(self):
+        for extra in (None, {}):
+            with patch("requests.Session.get", return_value=self._resp([])):
+                assert list(iter_features(
+                    "https://x/FeatureServer/0", max_record_count=10,
+                    extra_params=extra,
+                )) == []
+
+    def test_extra_params_survive_across_pages(self):
+        pages = [
+            self._resp([{"properties": {"i": i}} for i in range(2)], exceeded=True),
+            self._resp([{"properties": {"i": 9}}], exceeded=False),
+        ]
+        with patch("requests.Session.get", side_effect=pages) as get:
+            list(iter_features(
+                "https://x/FeatureServer/0", max_record_count=2,
+                extra_params={"geometryPrecision": 6},
+            ))
+        assert get.call_count == 2
+        for call in get.call_args_list:
+            assert call.kwargs["params"]["geometryPrecision"] == 6

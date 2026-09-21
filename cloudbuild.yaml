@@ -1,0 +1,50 @@
+# Cloud Build — build and push the connector image to Artifact Registry.
+#
+# Trigger this manually or wire it to a Cloud Build trigger on push to main.
+# The image tag is the git commit SHA, which Cloud Scheduler job revisions
+# can pin to a known-good build.
+#
+# Registry path:
+#   us-east1-docker.pkg.dev/juniper-crm-498215-p5/ingestion/connector:$COMMIT_SHA
+#
+# Prerequisite (one-time):
+#   gcloud artifacts repositories create ingestion \
+#     --repository-format=docker \
+#     --location=us-east1 \
+#     --project=juniper-crm-498215-p5
+
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    id: build
+    args:
+      - build
+      - "--tag"
+      - "us-east1-docker.pkg.dev/juniper-crm-498215-p5/ingestion/connector:$COMMIT_SHA"
+      - "--tag"
+      - "us-east1-docker.pkg.dev/juniper-crm-498215-p5/ingestion/connector:latest"
+      - "--file"
+      - "Dockerfile"
+      - "."
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: push-sha
+    waitFor:
+      - build
+    args:
+      - push
+      - "us-east1-docker.pkg.dev/juniper-crm-498215-p5/ingestion/connector:$COMMIT_SHA"
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: push-latest
+    waitFor:
+      - build
+    args:
+      - push
+      - "us-east1-docker.pkg.dev/juniper-crm-498215-p5/ingestion/connector:latest"
+
+images:
+  - "us-east1-docker.pkg.dev/juniper-crm-498215-p5/ingestion/connector:$COMMIT_SHA"
+  - "us-east1-docker.pkg.dev/juniper-crm-498215-p5/ingestion/connector:latest"
+
+options:
+  logging: CLOUD_LOGGING_ONLY

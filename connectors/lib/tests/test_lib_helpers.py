@@ -533,3 +533,45 @@ class TestEnrichRunner:
 
         captured = capsys.readouterr()
         assert "my_enricher" in captured.err
+
+
+class TestStateFipsToAbbr:
+    """TIGERweb returns the numeric state FIPS code, not a postal abbreviation."""
+
+    def test_covers_the_five_target_states(self):
+        from lib.geo import STATE_FIPS_TO_ABBR
+        assert STATE_FIPS_TO_ABBR["12"] == "FL"
+        assert STATE_FIPS_TO_ABBR["37"] == "NC"
+        assert STATE_FIPS_TO_ABBR["42"] == "PA"
+        assert STATE_FIPS_TO_ABBR["45"] == "SC"
+        assert STATE_FIPS_TO_ABBR["48"] == "TX"
+
+    def test_keys_are_zero_padded_strings(self):
+        """The leading zero is significant; round-tripping through int loses it."""
+        from lib.geo import STATE_FIPS_TO_ABBR
+        assert STATE_FIPS_TO_ABBR["01"] == "AL"
+        assert STATE_FIPS_TO_ABBR["06"] == "CA"
+        assert all(len(k) == 2 and k.isdigit() for k in STATE_FIPS_TO_ABBR)
+
+    def test_covers_50_states_dc_and_territories(self):
+        from lib.geo import STATE_FIPS_TO_ABBR
+        assert len(STATE_FIPS_TO_ABBR) == 56
+        assert STATE_FIPS_TO_ABBR["11"] == "DC"
+        assert STATE_FIPS_TO_ABBR["72"] == "PR"
+
+    def test_abbreviations_are_unique(self):
+        from lib.geo import STATE_FIPS_TO_ABBR
+        vals = list(STATE_FIPS_TO_ABBR.values())
+        assert len(vals) == len(set(vals))
+
+    def test_reverse_map_is_derived_not_duplicated(self):
+        from lib.geo import STATE_ABBR_TO_FIPS, STATE_FIPS_TO_ABBR
+        assert len(STATE_ABBR_TO_FIPS) == len(STATE_FIPS_TO_ABBR)
+        for fips, abbr in STATE_FIPS_TO_ABBR.items():
+            assert STATE_ABBR_TO_FIPS[abbr] == fips
+
+    def test_reverse_map_builds_tigerweb_where_clauses(self):
+        from lib.enums import PARKS_TARGET_STATES
+        from lib.geo import STATE_ABBR_TO_FIPS
+        codes = sorted(STATE_ABBR_TO_FIPS[s] for s in PARKS_TARGET_STATES)
+        assert codes == ["12", "37", "42", "45", "48"]

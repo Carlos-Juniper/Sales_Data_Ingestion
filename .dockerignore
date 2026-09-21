@@ -1,0 +1,35 @@
+# Local dev / VCS
+.git/
+.venv/
+venv/
+env/
+.vscode/
+.claude/
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Secrets — never bake into an image; pass via --env-file or Cloud Run env vars
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Bulk source data (NPPES/CMS downloads etc.) — connectors fetch these at
+# runtime or expect them mounted, not baked into the image.
+data/
+connectors/**/data/
+output/
+*.log
+*.gdb
+*.gpkg
+
+# Docs / IaC not needed inside the container
+*.md
+terraform/
+db/

@@ -1,5 +1,9 @@
-pandas>=2.0
+google-cloud-storage>=2.10  # D7 raw landing; lazy-imported so absence is graceful
+pandas>=2.0,<3  # pandas 3.0 removed .str-on-all-NA-float behavior the connectors rely on
+psycopg[binary]>=3.1
 python-dotenv>=1.0
 pyyaml>=6.0
+rapidfuzz>=3.0
 requests>=2.31
+sqlalchemy>=2.0
 urllib3>=2.0
