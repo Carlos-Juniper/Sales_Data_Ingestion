@@ -20,6 +20,8 @@ No coordinates in this source. No phone data. EIN is the natural key (zero-padde
 
 from __future__ import annotations
 
+import argparse
+import datetime
 import sys
 
 import pandas as pd
@@ -30,6 +32,9 @@ from lib.schema import build_canonical
 from lib.validate import assert_columns_present, assert_fill_rate, assert_min_rows
 
 # ---------------------------------------------------------------- constants
+
+# D3: source_id is a constant per source; the per-row id lives in natural_key.
+SOURCE_ID = "irs_bmf_deathcare"
 
 _DEFAULT_PATHS = [
     "https://www.irs.gov/pub/irs-soi/eo2.csv",
@@ -186,10 +191,11 @@ def report_quality(df: pd.DataFrame) -> None:
 
 def to_canonical(df: pd.DataFrame) -> pd.DataFrame:
     """Map normalized BMF columns to the standard deathcare output shape."""
+    # D3: source_id is the constant SOURCE_ID; natural_key carries the EIN.
     source_file = ", ".join(df["source_file"].dropna().unique().tolist())
     return build_canonical(
         df.index,
-        source_id=        "irs_bmf:" + df["EIN"].fillna(""),
+        source_id=        SOURCE_ID,
         natural_key=      df["EIN"],
         vertical=         "deathcare",
         account_type=     "cemetery",
@@ -203,3 +209,107 @@ def to_canonical(df: pd.DataFrame) -> pd.DataFrame:
         ein=              df["ein"],
         source_file=      source_file,
     )
+
+
+# ---------------------------------------------------------------- entrypoint
+
+
+def main() -> None:
+    """CLI entrypoint — load IRS BMF deathcare data and optionally write to DB."""
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "--out",
+        default="irs_bmf_deathcare.csv",
+        help="Output CSV path (default: irs_bmf_deathcare.csv)",
+    )
+    ap.add_argument(
+        "--write-db",
+        action="store_true",
+        help="Also write results to Postgres staging (requires DATABASE_URL). "
+             "Off by default — the CSV is always written regardless.",
+    )
+    ap.add_argument(
+        "--input",
+        nargs="+",
+        default=None,
+        metavar="PATH_OR_URL",
+        help="Local CSV paths or URLs to load (default: eo2.csv and eo3.csv from IRS). "
+             "Example: --input /data/eo2.csv /data/eo3.csv",
+    )
+    args = ap.parse_args()
+
+    paths = args.input or _DEFAULT_PATHS
+    sys.stderr.write(f"  irs_bmf_deathcare: loading {paths}\n")
+
+    raw = load_raw(paths=paths)
+    assert_source_shape(raw)
+
+    filtered = filter_cemetery(raw)
+    normalized = normalize(filtered)
+    report_quality(normalized)
+    canonical = to_canonical(normalized)
+
+    import json as _json
+    raw_bytes = _json.dumps(
+        raw.to_dict(orient="records"), sort_keys=True
+    ).encode("utf-8")
+
+    canonical.to_csv(args.out, index=False)
+    sys.stderr.write(f"\n  wrote {len(canonical):,} records -> {args.out}\n")
+
+    if args.write_db:
+        from lib.db import get_engine, write_source_run, upsert_staging, finish_source_run
+        from lib.gcs import raw_sha256, upload_raw
+        from lib.http import get_secret
+
+        if not get_secret("DATABASE_URL"):
+            sys.exit(
+                "ERROR: --write-db was given but DATABASE_URL is not set. "
+                "Copy .env.example -> .env and fill it in."
+            )
+
+        sha256_hex = raw_sha256(raw_bytes)
+        byte_count = len(raw_bytes)
+        sys.stderr.write(
+            f"  irs_bmf_deathcare: sha256={sha256_hex[:16]}…  bytes={byte_count:,}\n"
+        )
+
+        run_date = datetime.date.today().isoformat()
+        raw_uri = upload_raw(SOURCE_ID, run_date, raw_bytes)
+
+        engine = get_engine()
+        source_run_id: int | None = None
+        try:
+            source_run_id = write_source_run(
+                engine,
+                source_id=SOURCE_ID,
+                byte_count=byte_count,
+                sha256=sha256_hex,
+                connector_version="1.0",
+                license_string="IRS Statistics of Income — public domain",
+                raw_uri=raw_uri,
+            )
+
+            upsert_staging(engine, SOURCE_ID, canonical)
+
+            finish_source_run(
+                engine,
+                source_run_id,
+                status="succeeded",
+                row_count=len(canonical),
+            )
+            sys.stderr.write(
+                f"  irs_bmf_deathcare: wrote {len(canonical):,} rows "
+                f"to staging.{SOURCE_ID} (source_run_id={source_run_id})\n"
+            )
+        except Exception as exc:
+            if source_run_id is not None:
+                finish_source_run(engine, source_run_id, status="failed")
+            sys.exit(f"ERROR: DB write failed — {exc}")
+
+
+if __name__ == "__main__":
+    main()

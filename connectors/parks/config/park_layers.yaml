@@ -1,0 +1,186 @@
+# Parks layer registry — one entry per ArcGIS source.
+#
+# Each entry drives one generic harvest loop in park_layers.py; adding a new
+# state/layer requires only a new entry here, not new Python.
+#
+# Required keys per entry:
+#   url          — FeatureServer or MapServer layer endpoint
+#   where        — SQL WHERE clause passed to the query (use "1=1" for all rows)
+#   states       — list of 2-letter state codes this source covers
+#   name_field   — field carrying the park/unit name
+#   account_type — "municipal_park" or "state_park"
+#
+# Optional keys (null if not available):
+#   state_field  — field carrying the 2-letter state abbreviation; if null the
+#                  source is assumed to be state-scoped (no cross-state filter)
+#   id_field     — stable natural key field; falls back to OBJECTID if null
+#   owner_field  — legal owner name
+#   manager_field— management agency / operator name
+#   area_field   — pre-calculated area field name
+#   area_unit    — "acres" or "sqft"
+
+padus_parks:
+  # PAD-US 4.1 — Protected Areas Database of the US, national (USGS).
+  # ArcGIS Online item: d1c464bac63d44bc88a4a059dc69d259 (owner: mcroft@usgs.gov_USGS)
+  # PADUS4_1ManagerName layer — verified live: 257,320 LOC nationally.
+  # State counts: FL=7,847 | NC=1,794 | TX=17,737 | PA=35,042 | SC=2,316 (total ~64.7K)
+  # State filter baked into WHERE to avoid fetching all 257K nationally.
+  # Source_PAID is the natural key from source data (e.g. 'FL864').
+  # NOTE: df61d6a32f434b0ea7a9987209ab3817 is Oregon-only PAD-US — wrong source.
+  url: "https://services.arcgis.com/v01gqwM5QqNysAAi/arcgis/rest/services/Manager_Name_PADUS/FeatureServer/0"
+  where: "Mang_Type = 'LOC' AND State_Nm IN ('FL','NC','TX','PA','SC')"
+  states: [FL, NC, TX, PA, SC]
+  state_field: State_Nm
+  id_field: Source_PAID
+  name_field: Unit_Nm
+  owner_field: Own_Name
+  manager_field: Loc_Mang
+  area_field: GIS_Acres
+  area_unit: acres
+  account_type: municipal_park
+  # Loc_Mang is the raw local-manager string ("City of Cary Parks, Recreation &
+  # Cultural Resources").  This is the ONLY source whose manager_field names a
+  # governing body, and therefore the only one that feeds the §5.4 manager-name
+  # -> Census GEOID join.
+  manager_field_role: name
+
+pasda_dcnr_parks:
+  # PASDA / DCNR — Pennsylvania local parks (DCNR Local Park 202406).
+  # Layer 18 verified live. All field names confirmed against live schema.
+  #   PARK_ID    — stable integer natural key
+  #   PARK_NAME  — park name
+  #   GIS_Acres  — calculated polygon area in acres
+  url: "https://mapservices.pasda.psu.edu/server/rest/services/pasda/DCNR/MapServer/18"
+  where: "1=1"
+  states: [PA]
+  state_field: null
+  id_field: PARK_ID
+  name_field: PARK_NAME
+  owner_field: null
+  manager_field: null
+  area_field: GIS_Acres
+  area_unit: acres
+  account_type: municipal_park
+
+tpwd_state_parks:
+  # TPWD — Texas State Parks Boundaries (Park Boundary, layer 0).
+  # ArcGIS Online item: 47c52b2c0edb4af0ad2c27a17b262b87
+  # Org prefix 1mtXwieMId59thmg user-verified. Layer /0 confirmed: 116 records.
+  # No pre-calculated acres field — lat/lon from polygon bbox centroid only.
+  url: "https://services1.arcgis.com/1mtXwieMId59thmg/arcgis/rest/services/Texas_State_Parks_Boundaries/FeatureServer/0"
+  where: "1=1"
+  states: [TX]
+  state_field: null
+  id_field: null
+  name_field: ParkName
+  owner_field: null
+  manager_field: PropType
+  # area_field is deliberately null.  DO NOT set it back to Shape__Area.
+  #
+  # This layer's native spatialReference is wkid 102100 / 3857 (Web Mercator), and
+  # ESRI computes Shape__Area in the layer's own projection — so the value is
+  # Web Mercator square metres, not ground square metres.  Web Mercator inflates
+  # area by 1/cos^2(latitude), which across Texas is 1.24x (26N) to 1.53x (36N).
+  #
+  # Measured against geodesic area on all 116 records, dividing Shape__Area by
+  # 4046.86 over-reported acreage by ~35% (median computed/published = 0.740,
+  # and 1/cos^2(31N) = 1.361 accounts for it).  Every one of the 116 rows was
+  # more than 10% out.  Verified 2026-09-04.
+  #
+  # TPWD publishes no true acreage field, so the authoritative figure for this
+  # source is park_attrs.acres_computed — ST_Area(boundary::geography), measured
+  # on the ellipsoid by PostGIS.  acres_published stays NULL, which is honest:
+  # there is no published figure worth recording.
+  area_field: null
+  area_unit: null
+  account_type: state_park
+  # Every record here is maintained by one state agency, so the account is that
+  # agency, not whichever municipality the park happens to sit inside.
+  managing_agency: "Texas Parks and Wildlife Department"
+  managing_agency_slug: tpwd
+
+fdep_state_parks:
+  # FDEP — Florida State Park Boundaries (PARKS_BOUNDARIES MapServer, layer 0).
+  # Verified live: 179 records, polygon geometry, all confirmed fields below.
+  #   UNIT_ID    — stable string natural key (e.g. "S00086")
+  #   SITE_NAME  — park name
+  #   ACREAGE    — pre-calculated total acres
+  #   ADDRESS    — street address (bonus — not available in other state-parks sources)
+  # Note: PARKS_FORI/MapServer/0 is the 12K-row FDEP outdoor rec inventory (all
+  # agency types). PARKS_BOUNDARIES/0 is the cleaner dedicated state-parks layer.
+  # response_format=json: ca.dep.state.fl.us MapServer returns 500 with f=geojson.
+  # timeout=90: ca.dep.state.fl.us is a slow state server; 30s frequently times out.
+  url: "https://ca.dep.state.fl.us/arcgis/rest/services/OpenData/PARKS_BOUNDARIES/MapServer/0"
+  where: "1=1"
+  states: [FL]
+  state_field: null
+  id_field: UNIT_ID
+  name_field: SITE_NAME
+  address_field: ADDRESS
+  owner_field: null
+  manager_field: null
+  area_field: ACREAGE
+  area_unit: acres
+  account_type: state_park
+  # Every record here is maintained by one state agency, so the account is that
+  # agency, not whichever municipality the park happens to sit inside.
+  managing_agency: "Florida Department of Environmental Protection"
+  managing_agency_slug: fdep
+  response_format: json
+  timeout: 90
+
+nc_state_parks:
+  # NC State Parks System — official boundaries from NC Dept. of Parks & Recreation.
+  # ArcGIS Online item: 4003ab82c17f49c2bf3b81b7e0484e48 (owner: NCStateParks_NCDPR)
+  # FeatureServer layer 0 (ParkBoundaries) verified live: 346 records.
+  # 346 polygon records = individual park parcels/sub-units across ~41 NC state parks.
+  #   FID      — stable integer natural key
+  #   PK_NAME  — park name
+  #   ACRES    — pre-calculated area in acres
+  #   PK_TYPE  — park classification (SP=State Park, SNA=State Natural Area, etc.)
+  #   PKABBR   — 4-letter park abbreviation
+  # This replaces the NHP managed-areas workaround — NCDPR publishes boundaries directly.
+  # response_format=json: this FeatureServer claims geojson support but returns 0
+  # features with f=geojson; f=json returns 346 records with "attributes" dicts.
+  url: "https://services6.arcgis.com/nRIB86xC7kq6wavB/arcgis/rest/services/NC_State_Parks_System/FeatureServer/0"
+  where: "1=1"
+  states: [NC]
+  state_field: null
+  id_field: FID
+  name_field: PK_NAME
+  owner_field: null
+  manager_field: PK_TYPE
+  area_field: ACRES
+  area_unit: acres
+  account_type: state_park
+  # Every record here is maintained by one state agency, so the account is that
+  # agency, not whichever municipality the park happens to sit inside.
+  managing_agency: "North Carolina Division of Parks and Recreation"
+  managing_agency_slug: ncdpr
+  response_format: json
+  order_by_field: FID
+  timeout: 30
+
+sc_state_parks:
+  # SC — South Carolina State Parks (SCPRT).
+  # ArcGIS Online FeatureServer verified live: 55 records, polygon geometry.
+  # All parks in this layer are SCPRT-managed state parks — no MGT_AGENCY filter needed.
+  #   FID          — esriFieldTypeOID natural key (not OBJECTID)
+  #   NAME         — park name
+  #   Area_Acres   — pre-calculated area in acres
+  url: "https://services5.arcgis.com/bPacKTm9cauMXVfn/ArcGIS/rest/services/South_Carolina_State_Parks/FeatureServer/0"
+  where: "1=1"
+  states: [SC]
+  state_field: null
+  id_field: FID
+  name_field: NAME
+  owner_field: null
+  manager_field: null
+  area_field: Area_Acres
+  area_unit: acres
+  account_type: state_park
+  # Every record here is maintained by one state agency, so the account is that
+  # agency, not whichever municipality the park happens to sit inside.
+  managing_agency: "South Carolina Department of Parks, Recreation and Tourism"
+  managing_agency_slug: scprt
+  order_by_field: FID

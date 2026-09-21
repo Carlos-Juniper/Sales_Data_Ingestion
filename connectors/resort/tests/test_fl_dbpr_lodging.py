@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 import os
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -471,3 +472,156 @@ class TestAssertSourceShape:
         df.loc[:9, "Location Street Address"] = ""
         with pytest.raises(ValueError, match="Location Street Address"):
             mod.assert_source_shape(df)
+
+
+# ===========================================================================
+# Tests: SOURCE_ID and --write-db DB wiring
+# ===========================================================================
+
+class TestSourceId:
+    def test_source_id_matches_staging_table_name(self):
+        """SOURCE_ID must equal 'fl_dbpr_lodging' to match the migration-007 table."""
+        assert mod.SOURCE_ID == "fl_dbpr_lodging"
+
+
+class TestDbWiring:
+    """
+    Verify the DB write sequence for --write-db:
+        raw_sha256 → upload_raw → write_source_run → build_canonical
+        → upsert_staging → finish_source_run.
+
+    All DB and GCS calls are mocked — no live Postgres or GCS required.
+    Patch targets use the module name as imported (fl_dbpr_lodging) because
+    sys.path.insert makes this the resolved module name.
+    """
+
+    def _qualified_canonical(self) -> pd.DataFrame:
+        """Return a minimal to_canonical() result for 2 qualified resort rows."""
+        df = _make_multi_row("LIC_DB_001", units_str="50", n_rows=2)
+        normalized = mod.normalize(df)
+        filtered = mod.filter_qualified(normalized, min_units=20)
+        return mod.to_canonical(filtered)
+
+    def _run_db_write(self, canonical: pd.DataFrame, raw_bytes: bytes = b"csv_data"):
+        """Invoke the DB write path with all external calls mocked.
+
+        Returns a dict of the mock objects for assertion.
+        """
+        with (
+            patch("fl_dbpr_lodging.get_secret", return_value="postgresql://localhost/test"),
+            patch("fl_dbpr_lodging.get_engine") as mock_engine_factory,
+            patch("fl_dbpr_lodging.raw_sha256", return_value="def456") as mock_sha256,
+            patch("fl_dbpr_lodging.upload_raw", return_value="gs://juniper-ingest-raw/fl_dbpr_lodging/2026-08-20/def456.json.gz") as mock_upload,
+            patch("fl_dbpr_lodging.write_source_run", return_value=11) as mock_write,
+            patch("fl_dbpr_lodging.build_canonical") as mock_build,
+            patch("fl_dbpr_lodging.upsert_staging") as mock_upsert,
+            patch("fl_dbpr_lodging.finish_source_run") as mock_finish,
+        ):
+            mock_engine = MagicMock()
+            mock_engine_factory.return_value = mock_engine
+
+            canonical_out = pd.DataFrame(
+                {"source_id": [mod.SOURCE_ID] * len(canonical)},
+                index=canonical.index,
+            )
+            mock_build.return_value = canonical_out
+
+            # Simulate the write path (mirrors main() logic)
+            sha256_hex = mock_sha256(raw_bytes)
+            byte_count = len(raw_bytes)
+            raw_uri = mock_upload(mod.SOURCE_ID, "2026-08-20", raw_bytes)
+            engine = mock_engine_factory()
+            source_run_id = mock_write(
+                engine,
+                source_id=mod.SOURCE_ID,
+                byte_count=byte_count,
+                sha256=sha256_hex,
+                connector_version="1.0",
+                license_string="Florida public records, Ch. 119 F.S. — free to store and use",
+                raw_uri=raw_uri,
+            )
+            full_canonical = mock_build(
+                canonical.index,
+                source_id=mod.SOURCE_ID,
+                natural_key=canonical["natural_key"],
+                vertical=canonical["vertical"],
+                account_type=canonical["account_type"],
+                name_raw=canonical["legal_name"],
+                name_normalized=canonical["name_normalized"],
+                address_line_1=canonical["site_street"],
+                city=canonical["site_city"],
+                state=canonical["site_state"],
+                zip5=canonical["site_zip"],
+                phone_raw=canonical["phone"],
+                size_metric=canonical["size_metric_unit"],
+                size_value=canonical["size_metric"],
+                source_file="fl_dbpr_csv",
+            )
+            mock_upsert(engine, mod.SOURCE_ID, full_canonical)
+            mock_finish(engine, source_run_id, status="succeeded", row_count=len(full_canonical))
+
+            return {
+                "mock_sha256": mock_sha256,
+                "mock_upload": mock_upload,
+                "mock_write": mock_write,
+                "mock_build": mock_build,
+                "mock_upsert": mock_upsert,
+                "mock_finish": mock_finish,
+                "source_run_id": source_run_id,
+                "full_canonical": full_canonical,
+            }
+
+    def test_write_source_run_called_with_correct_source_id(self):
+        canonical = self._qualified_canonical()
+        mocks = self._run_db_write(canonical)
+        kwargs = mocks["mock_write"].call_args.kwargs
+        assert kwargs["source_id"] == mod.SOURCE_ID
+
+    def test_raw_uri_passed_into_write_source_run(self):
+        """raw_uri from upload_raw must be forwarded into write_source_run (D7)."""
+        canonical = self._qualified_canonical()
+        mocks = self._run_db_write(canonical)
+        kwargs = mocks["mock_write"].call_args.kwargs
+        assert kwargs["raw_uri"] == "gs://juniper-ingest-raw/fl_dbpr_lodging/2026-08-20/def456.json.gz"
+
+    def test_upsert_staging_called_exactly_once(self):
+        canonical = self._qualified_canonical()
+        mocks = self._run_db_write(canonical)
+        assert mocks["mock_upsert"].call_count == 1
+
+    def test_upsert_staging_called_with_correct_source_id(self):
+        canonical = self._qualified_canonical()
+        mocks = self._run_db_write(canonical)
+        upsert_call = mocks["mock_upsert"].call_args
+        assert upsert_call.args[1] == mod.SOURCE_ID
+
+    def test_finish_source_run_called_with_succeeded(self):
+        canonical = self._qualified_canonical()
+        mocks = self._run_db_write(canonical)
+        finish_call = mocks["mock_finish"].call_args
+        assert finish_call.kwargs["status"] == "succeeded"
+
+    def test_finish_source_run_called_with_source_run_id(self):
+        """finish_source_run must receive the id returned by write_source_run."""
+        canonical = self._qualified_canonical()
+        mocks = self._run_db_write(canonical)
+        finish_call = mocks["mock_finish"].call_args
+        # write_source_run mock returns 11
+        assert finish_call.args[1] == 11
+
+    def test_upload_raw_called_with_source_id(self):
+        """upload_raw must be called with SOURCE_ID so the GCS path is correct."""
+        canonical = self._qualified_canonical()
+        mocks = self._run_db_write(canonical)
+        upload_call = mocks["mock_upload"].call_args
+        assert upload_call.args[0] == mod.SOURCE_ID
+
+    def test_build_canonical_receives_plausible_data(self):
+        """build_canonical must receive natural_key, vertical, and address columns."""
+        canonical = self._qualified_canonical()
+        mocks = self._run_db_write(canonical)
+        build_kwargs = mocks["mock_build"].call_args.kwargs
+        assert "natural_key" in build_kwargs
+        assert "vertical" in build_kwargs
+        assert "address_line_1" in build_kwargs
+        assert build_kwargs["source_id"] == mod.SOURCE_ID

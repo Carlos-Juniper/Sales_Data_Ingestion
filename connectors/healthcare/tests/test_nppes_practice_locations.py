@@ -30,6 +30,7 @@ from healthcare.nppes_practice_locations import (
     normalize_and_join,
     report_quality,
 )
+from lib.enums import HEALTHCARE_TARGET_STATES
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +118,11 @@ class TestNormalizeAndJoin:
             "Provider Organization Name (Legal Business Name)": ["Test Org"],
             "taxonomy_primary": ["261QM0801X"],
         })
+        # Use FL (in-scope) so the state filter inside normalize_and_join() does
+        # not drop the row — this test is about natural_key construction.
         pl_df = _make_pl_df([
             {"NPI": "1234567890", _PL_COL_ADDR1: "1 Test Blvd",
-             _PL_COL_STATE: "CA", _PL_COL_ZIP: "90001"},
+             _PL_COL_STATE: "FL", _PL_COL_ZIP: "33001"},
         ])
 
         result = normalize_and_join(main_slim, pl_df)
@@ -180,10 +183,16 @@ class TestNormalizeAndJoin:
         assert result.iloc[0]["zip5"] == "33026"
 
     def test_output_columns_match_expected_schema(self):
-        """Output DataFrame has exactly the required columns in order."""
+        """Output DataFrame has exactly the required columns in order.
+
+        D17a: phone_raw and phone_normalized are now included so the pipeline
+        can carry NPPES per-location phone numbers into resolved_account.phone
+        and resolved_contact.phone.
+        """
         expected_cols = [
             "natural_key", "npi", "location_seq", "name_raw",
             "address_line_1", "city", "site_state", "zip5", "taxonomy_primary",
+            "phone_raw", "phone_normalized",
         ]
         main_slim = pd.DataFrame({
             "NPI": ["1234567890"],
@@ -355,3 +364,91 @@ class TestTaxonomyFilter:
         result = filter_to_facility_orgs(df)
         assert len(result) == 1
         assert result.iloc[0]["NPI"] == "1000000001"
+
+
+# ---------------------------------------------------------------------------
+# D10: state filter tests (normalize_and_join applies HEALTHCARE_TARGET_STATES)
+# ---------------------------------------------------------------------------
+
+
+def _make_slim_main(npis: list[str]) -> pd.DataFrame:
+    """
+    Build a post-filter_to_facility_orgs-shaped main_df (slim).
+
+    normalize_and_join receives the slim form (NPI, org name, taxonomy_primary)
+    after filter_to_facility_orgs has already run, so we produce that shape
+    directly to keep the state-filter tests focused on normalize_and_join.
+    """
+    return pd.DataFrame({
+        "NPI": npis,
+        "Provider Organization Name (Legal Business Name)": [f"Org {npi}" for npi in npis],
+        "taxonomy_primary": ["261QM0801X"] * len(npis),
+    })
+
+
+class TestNppesStateFilter:
+    def test_out_of_state_rows_dropped_by_normalize_and_join(self):
+        """
+        normalize_and_join() must drop secondary-location rows whose state is
+        outside the 5 target states.
+
+        CA is not in scope; FL and TX are.  Confirms the filter runs inside
+        normalize_and_join() — before report_quality() or upsert_staging().
+        """
+        main_slim = _make_slim_main(["1111111111", "2222222222", "3333333333"])
+        pl_df = _make_pl_df([
+            {"NPI": "1111111111", _PL_COL_ADDR1: "1 FL St",
+             _PL_COL_STATE: "FL", _PL_COL_ZIP: "33001"},
+            {"NPI": "2222222222", _PL_COL_ADDR1: "1 CA St",
+             _PL_COL_STATE: "CA", _PL_COL_ZIP: "90001"},
+            {"NPI": "3333333333", _PL_COL_ADDR1: "1 TX St",
+             _PL_COL_STATE: "TX", _PL_COL_ZIP: "75001"},
+        ])
+        result = normalize_and_join(main_slim, pl_df)
+        assert set(result["site_state"]) == {"FL", "TX"}
+        assert len(result) == 2
+
+    def test_all_target_states_kept(self):
+        """One secondary location per target state — all five must survive."""
+        target_list = sorted(HEALTHCARE_TARGET_STATES)
+        npis = [f"100000000{i}" for i in range(len(target_list))]
+        main_slim = _make_slim_main(npis)
+        pl_df = _make_pl_df([
+            {"NPI": npi, _PL_COL_ADDR1: f"1 St", _PL_COL_STATE: state, _PL_COL_ZIP: "00000"}
+            for npi, state in zip(npis, target_list)
+        ])
+        result = normalize_and_join(main_slim, pl_df)
+        assert set(result["site_state"]) == HEALTHCARE_TARGET_STATES
+        assert len(result) == 5
+
+    def test_all_out_of_state_returns_empty(self):
+        """When every pl_ row is out-of-state, normalize_and_join returns empty."""
+        main_slim = _make_slim_main(["1111111111", "2222222222"])
+        pl_df = _make_pl_df([
+            {"NPI": "1111111111", _PL_COL_ADDR1: "1 CA St",
+             _PL_COL_STATE: "CA", _PL_COL_ZIP: "90001"},
+            {"NPI": "2222222222", _PL_COL_ADDR1: "1 NY St",
+             _PL_COL_STATE: "NY", _PL_COL_ZIP: "10001"},
+        ])
+        result = normalize_and_join(main_slim, pl_df)
+        assert len(result) == 0
+
+    def test_filter_inside_normalize_and_join_not_deferred_to_caller(self):
+        """
+        The filter runs inside normalize_and_join() — the caller cannot receive
+        out-of-state rows and accidentally pass them to geocoding or upsert_staging().
+
+        Regression: verifies the filter position is inside normalize_and_join(),
+        not deferred to a separate step the caller could skip.
+        """
+        main_slim = _make_slim_main(["1111111111", "2222222222"])
+        pl_df = _make_pl_df([
+            {"NPI": "1111111111", _PL_COL_ADDR1: "1 NC St",
+             _PL_COL_STATE: "NC", _PL_COL_ZIP: "27601"},
+            {"NPI": "2222222222", _PL_COL_ADDR1: "1 WA St",
+             _PL_COL_STATE: "WA", _PL_COL_ZIP: "98101"},
+        ])
+        result = normalize_and_join(main_slim, pl_df)
+        # WA must never reach the caller regardless of what they do next.
+        assert "WA" not in result["site_state"].values
+        assert list(result["site_state"]) == ["NC"]

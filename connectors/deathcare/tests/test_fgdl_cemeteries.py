@@ -318,15 +318,15 @@ class TestToCanonical:
         missing = set(CANONICAL_COLUMNS) - set(out.columns)
         assert not missing, f"Missing columns: {missing}"
 
-    def test_source_id_prefixed_with_fgdl(self):
-        """source_id must be 'fgdl:' + str(GCID)."""
+    def test_source_id_is_constant_fgdl_cemeteries(self):
+        """D3: source_id must be the constant 'fgdl_cemeteries', not a per-row composite."""
         out = mod.to_canonical(self._normalized_df(GCID=483))
-        assert out["source_id"].iloc[0] == "fgdl:483"
+        assert out["source_id"].iloc[0] == "fgdl_cemeteries"
 
-    def test_source_id_integer_gcid_rendered_as_string(self):
-        """GCID=483 must produce 'fgdl:483', not 'fgdl:483.0'."""
+    def test_source_id_does_not_vary_with_gcid(self):
+        """D3: source_id is a constant — it must not embed the GCID value."""
         out = mod.to_canonical(self._normalized_df(GCID=483))
-        assert "." not in out["source_id"].iloc[0]
+        assert ":" not in out["source_id"].iloc[0]
 
     def test_natural_key_matches_gcid_string(self):
         out = mod.to_canonical(self._normalized_df(GCID=483))

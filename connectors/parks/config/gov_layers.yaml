@@ -1,0 +1,95 @@
+# Government-unit registry — the parks account spine.
+#
+# Ingestion-Plan-of-Action §6.4: "the municipality is the account; parks are child
+# locations."  These three layers enumerate those accounts.  Parks harvested by
+# park_layers.yaml become child locations hanging off them via manager_resolve.py.
+#
+# Source: Census TIGERweb ArcGIS REST services.  Chosen over the TIGER/Line
+# shapefile downloads (www2.census.gov/geo/tiger/) because the REST endpoints are
+# queryable, return WGS84 GeoJSON directly, and are consumable by the existing
+# lib/arcgis.py helpers — no shapefile reader, no GDAL, no new dependency.
+# Public domain, no API key, no token.
+#
+# Row counts below were verified live against these exact endpoints on 2026-09-04
+# and are asserted in tests/test_gov_layers_config.py.  They are stable
+# (TIGER revises annually), so a mismatch means an upstream vintage change worth
+# investigating, not a flaky test.
+#
+# Required keys per entry:
+#   url           — MapServer layer endpoint
+#   where         — SQL WHERE clause
+#   states        — list of 2-letter state codes this entry covers
+#   account_type  — "municipality" or "county"
+#
+# Every field mapping is optional and defaults to the TIGER standard name
+# (GEOID / NAME / BASENAME / STATE / COUNTY / INTPTLAT / INTPTLON / AREALAND).
+
+tiger_places:
+  # Incorporated places — cities, towns, villages, boroughs.  3,470 rows:
+  #   FL 411 | NC 549 | TX 1,227 | PA 1,012 | SC 271
+  #
+  # 3,476 places exist in the 5 states; FUNCSTAT='A' drops 6 inactive ones
+  # (3 NC, 3 TX).  Those carry PLACECC='C9' and have no functioning government,
+  # so they would be dead accounts no rep could ever sell to.
+  #
+  # Layer 4 is incorporated-places-ONLY; Census Designated Places are layer 5.
+  # That layer choice is what satisfies the plan's "filter CLASSFP to keep
+  # incorporated (C1-C9) and drop CDPs (U1/U2) or you will invent thousands of
+  # phantom accounts that have no Parks Director and cannot sign a contract."
+  # There is no CLASSFP field on TIGERweb; the analogous field is PLACECC, and
+  # FUNCSTAT='A' is the filter that matters — it drops the inactive PLACECC='C9'
+  # records that would otherwise become dead accounts.
+  #
+  # county_field is deliberately null: a place may straddle county lines (e.g.
+  # Dallas spans 5 counties), so there is no single COUNTY value.  County is
+  # resolved spatially instead when needed.
+  url: "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Places_CouSub_ConCity_SubMCD/MapServer/4"
+  where: "STATE IN ('12','37','42','45','48') AND FUNCSTAT='A'"
+  states: [FL, NC, TX, PA, SC]
+  account_type: municipality
+  county_field: null
+  page_size: 500
+  timeout: 90
+
+tiger_cousub:
+  # Minor Civil Divisions — PENNSYLVANIA ONLY, on purpose.  1,543 rows.
+  #
+  # PA is the one target state where townships are general-purpose governments
+  # that award their own landscaping contracts.  The plan flags this: "Pennsylvania
+  # alone is ~2,560 municipalities because townships are general-purpose
+  # governments there; it will dominate raw record count."
+  #
+  # This does NOT double-count against tiger_places.  In PA's MCD layer only
+  # COUSUBCC='T1' (township) carries FUNCSTAT='A'; cities and boroughs appear with
+  # FUNCSTAT='F' because their incorporated-place record is the authoritative one.
+  # So FUNCSTAT='A' yields townships only, and:
+  #     1,543 townships + 1,012 PA incorporated places = 2,555 ~= the plan's ~2,560
+  # Verified live 2026-09-04: the only (COUSUBCC, FUNCSTAT) pairs present for PA
+  # are T1/A, T9/I, C5/F and Z9/F.
+  #
+  # Do NOT add the other four states here: their county subdivisions are census
+  # county divisions or non-functioning townships with no government to sell to.
+  url: "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Places_CouSub_ConCity_SubMCD/MapServer/1"
+  where: "STATE='42' AND FUNCSTAT='A'"
+  states: [PA]
+  account_type: municipality
+  county_field: COUNTY
+  page_size: 500
+  timeout: 90
+
+tiger_counties:
+  # Counties — 534 rows across the 5 states, which matches the plan's stated
+  # "534 counties" exactly.
+  #
+  # Counties serve double duty: they are real accounts (county parks departments
+  # award contracts), and they are the guaranteed fallback parent in
+  # manager_resolve.py.  Counties tile the state with no gaps, so every park
+  # resolves to at least a county — which is what lets the pipeline promise that
+  # no park is ever dropped for want of a parent account.
+  url: "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/MapServer/1"
+  where: "STATE IN ('12','37','42','45','48')"
+  states: [FL, NC, TX, PA, SC]
+  account_type: county
+  county_field: COUNTY
+  page_size: 250
+  timeout: 90

@@ -67,6 +67,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,13 +77,17 @@ from typing import Any
 import pandas as pd
 import requests
 import yaml
+from sqlalchemy import text
 
 # connectors/lib is a shared package one level up from this vertical folder.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.arcgis import make_session, spatial_point_lookup
 from lib.enrich_runner import run_enrichment
+from lib.http import get_secret
 from lib.normalize import normalize_name
+
+logger = logging.getLogger(__name__)
 
 SOURCE_ID = "parcel_acreage_enrich"
 SQFT_PER_ACRE = 43_560.0
@@ -486,6 +492,90 @@ def print_summary(df: pd.DataFrame) -> None:
             print(f"    {c}", file=sys.stderr)
 
 
+# ---------------------------------------------------------------- DB write helper
+
+
+def upsert_enrich_parcel(engine, source_id: str, enriched: pd.DataFrame) -> int:
+    """
+    Upsert parcel enrichment results into staging.enrich_parcel.
+
+    PK is (source_id, natural_key) — on conflict the maintained_acres and
+    boundary columns are updated and enriched_at is bumped, making re-runs
+    idempotent per D6.
+
+    Only rows with lookup_status in ('ok', 'ok_multi_parcel') have an
+    actual maintained_acres value; other rows land with NULL acres/boundary
+    but still occupy a slot in the cache so they are not re-fetched.
+
+    boundary is stored as a PostGIS MultiPolygon (SRID 4326).  The enricher
+    produces raw GeoJSON (Polygon or GeometryCollection); we wrap it in
+    ST_Multi() so the column type is always satisfied.  NULL boundary_geojson
+    rows land with NULL boundary.
+
+    Returns the number of rows written.
+    """
+    if enriched.empty:
+        logger.warning(
+            "upsert_enrich_parcel: empty DataFrame for source_id=%r — nothing written",
+            source_id,
+        )
+        return 0
+
+    upsert_sql = text("""
+        INSERT INTO staging.enrich_parcel
+            (source_id, natural_key, maintained_acres, boundary)
+        VALUES (
+            :source_id,
+            :natural_key,
+            CAST(:maintained_acres AS numeric),
+            CASE
+                WHEN :boundary_geojson IS NOT NULL
+                THEN ST_Multi(
+                    ST_SetSRID(
+                        ST_GeomFromGeoJSON(:boundary_geojson),
+                        4326
+                    )
+                )
+                ELSE NULL
+            END
+        )
+        ON CONFLICT (source_id, natural_key) DO UPDATE SET
+            maintained_acres = EXCLUDED.maintained_acres,
+            boundary         = EXCLUDED.boundary,
+            enriched_at      = now()
+    """)
+
+    def _clean(v: Any) -> Any:
+        """Coerce NaN → None so CAST(:x AS numeric) doesn't receive a Python float NaN."""
+        try:
+            if v is None:
+                return None
+            if isinstance(v, float) and math.isnan(v):
+                return None
+            return v
+        except (TypeError, ValueError):
+            return None
+
+    rows = []
+    for _, row in enriched.iterrows():
+        rows.append({
+            "source_id": source_id,
+            "natural_key": str(row["natural_key"]),
+            "maintained_acres": _clean(row.get("maintained_acres")),
+            "boundary_geojson": row.get("boundary_geojson") or None,
+        })
+
+    with engine.begin() as conn:
+        conn.execute(upsert_sql, rows)
+
+    logger.info(
+        "upsert_enrich_parcel: wrote %d rows to staging.enrich_parcel (source_id=%r)",
+        len(rows),
+        source_id,
+    )
+    return len(rows)
+
+
 # ---------------------------------------------------------------- entrypoint
 
 
@@ -498,10 +588,26 @@ def main() -> None:
                     help="parallel HTTP workers (default 4; set 1 to serialize for debugging)")
     ap.add_argument("--config", default=None, metavar="YAML",
                     help="path to a parcel_layers YAML (default: config/parcel_layers.yaml)")
+    ap.add_argument(
+        "--write-db",
+        action="store_true",
+        help=(
+            "Write parcel enrichment results to staging.enrich_parcel (requires DATABASE_URL). "
+            "On conflict, updates maintained_acres and boundary and bumps enriched_at."
+        ),
+    )
     args = ap.parse_args()
 
     if args.config:
         print(f"using layer config: {args.config}", file=sys.stderr)
+
+    # Validate DATABASE_URL before doing any expensive ArcGIS work.
+    if args.write_db:
+        if not get_secret("DATABASE_URL"):
+            sys.exit(
+                "ERROR: --write-db was given but DATABASE_URL is not set. "
+                "Copy .env.example -> .env and fill it in."
+            )
 
     print(f"reading {args.input}", file=sys.stderr)
     df = pd.read_csv(args.input, dtype=str, keep_default_na=False)
@@ -518,6 +624,15 @@ def main() -> None:
     results.to_csv(args.out, index=False)
     print(f"\nwrote {len(results):,} rows -> {args.out}", file=sys.stderr)
     print_summary(results)
+
+    if args.write_db:
+        from lib.db import get_engine
+        engine = get_engine()
+        written = upsert_enrich_parcel(engine, SOURCE_ID, results)
+        print(
+            f"  parcel_acreage_enrich: upserted {written:,} rows to staging.enrich_parcel",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
