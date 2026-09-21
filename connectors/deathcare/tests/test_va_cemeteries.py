@@ -319,21 +319,23 @@ class TestToCanonical:
         missing = set(CANONICAL_COLUMNS) - set(out.columns)
         assert not missing, f"Missing columns: {missing}"
 
-    def test_source_id_prefixed_with_va(self):
-        """CRITICAL: source_id must start with 'va:', not 'nsd:' or bare name."""
+    def test_source_id_is_constant_va_cemeteries(self):
+        """D3: source_id must be the constant 'va_cemeteries', not a per-row composite."""
         df = _make_raw(cemetery_name="Tahoma National Cemetery", address="18600 SE 240th St, Kent, WA 98042")
         out = mod.to_canonical(mod.normalize(df))
-        assert out["source_id"].iloc[0].startswith("va:")
+        assert out["source_id"].iloc[0] == "va_cemeteries"
 
-    def test_source_id_contains_name_and_state_abbr(self):
+    def test_source_id_does_not_encode_name_or_state(self):
+        """D3: source_id is a constant — name and state_abbr live in natural_key only."""
         df = _make_raw(
             cemetery_name="Biloxi National Cemetery",
             address="400 Veterans Ave, Biloxi, MS 39535",
         )
         out = mod.to_canonical(mod.normalize(df))
         sid = out["source_id"].iloc[0]
-        assert "BILOXI NATIONAL CEMETERY" in sid
-        assert "|MS" in sid
+        assert sid == "va_cemeteries"
+        assert "BILOXI" not in sid
+        assert "|MS" not in sid
 
     def test_natural_key_uses_full_state_name(self):
         """natural_key uses state full-name (stable) not the parsed abbreviation."""

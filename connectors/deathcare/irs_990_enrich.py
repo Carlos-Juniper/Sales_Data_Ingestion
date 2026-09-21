@@ -32,12 +32,14 @@ Output columns added
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from typing import Any
 
 import pandas as pd
 import requests
+from sqlalchemy import text
 
 from lib.enrich_runner import run_enrichment
 from lib.enums import SEGMENT_RELIGIOUS, ENRICH_OK, ENRICH_NOT_FOUND, ENRICH_ERROR, ENRICH_SKIPPED
@@ -223,6 +225,46 @@ def enrich(
 # ---------------------------------------------------------------- summary
 
 
+def upsert_enrich_irs990(engine, df: pd.DataFrame) -> int:
+    """
+    Upsert enriched 990 rows into staging.enrich_irs990.
+
+    PK is (source_id, natural_key) per D6.  Only rows where enrich_status
+    is not 'skipped' are written — skipped rows have no enrichment data.
+    Rows that were skipped (segment != religious or no EIN) are not inserted;
+    if they already exist in the cache they are left unchanged.
+
+    Returns the number of rows written.
+    """
+    eligible = df[df["enrich_status"] != ENRICH_SKIPPED].copy()
+    if eligible.empty:
+        return 0
+
+    sql = text("""
+        INSERT INTO staging.enrich_irs990 (
+            source_id, natural_key,
+            phone_990, contact_name_990, enrich_status
+        ) VALUES (
+            :source_id, :natural_key,
+            :phone_990, :contact_name_990, :enrich_status
+        )
+        ON CONFLICT (source_id, natural_key) DO UPDATE SET
+            phone_990        = EXCLUDED.phone_990,
+            contact_name_990 = EXCLUDED.contact_name_990,
+            enrich_status    = EXCLUDED.enrich_status,
+            enriched_at      = now()
+    """)
+
+    rows = eligible[
+        ["source_id", "natural_key", "phone_990", "contact_name_990", "enrich_status"]
+    ].to_dict(orient="records")
+
+    with engine.begin() as conn:
+        conn.execute(sql, rows)
+
+    return len(rows)
+
+
 def print_summary(df: pd.DataFrame) -> None:
     """
     Log enrichment summary statistics to stderr.
@@ -253,3 +295,86 @@ def print_summary(df: pd.DataFrame) -> None:
         sys.stderr.write(
             f"    contact_name_990 {name_filled:>7,}  ({100 * name_filled / total:.1f}% filled)\n"
         )
+
+
+# ---------------------------------------------------------------- entrypoint
+
+
+def main() -> None:
+    """
+    CLI entrypoint — enrich BMF canonical output via ProPublica 990 API.
+
+    Reads the canonical BMF CSV (produced by irs_bmf_deathcare.py), enriches
+    religious-segment rows with phone/contact data from the 990 API, and
+    optionally upserts results into staging.enrich_irs990.
+    """
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "--input",
+        required=True,
+        metavar="CSV_PATH",
+        help="Path to the canonical BMF CSV (output of irs_bmf_deathcare.py).",
+    )
+    ap.add_argument(
+        "--out",
+        default="irs_990_enriched.csv",
+        help="Output CSV path (default: irs_990_enriched.csv)",
+    )
+    ap.add_argument(
+        "--write-db",
+        action="store_true",
+        help="Also upsert enriched rows into staging.enrich_irs990 "
+             "(requires DATABASE_URL). Off by default.",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Thread pool size for concurrent API calls (default: 4).",
+    )
+    ap.add_argument(
+        "--sleep",
+        type=float,
+        default=0.5,
+        help="Seconds to sleep between API calls per thread (default: 0.5).",
+    )
+    args = ap.parse_args()
+
+    sys.stderr.write(f"  irs_990_enrich: reading {args.input}\n")
+    canonical = pd.read_csv(args.input, dtype=str)
+
+    # enrich() expects segment and ein columns to be present.
+    if "segment" not in canonical.columns or "ein" not in canonical.columns:
+        sys.exit(
+            "ERROR: input CSV must contain 'segment' and 'ein' columns. "
+            "Run irs_bmf_deathcare.py first to produce the canonical output."
+        )
+
+    enriched = enrich(canonical, workers=args.workers, sleep_s=args.sleep)
+    print_summary(enriched)
+
+    enriched.to_csv(args.out, index=False)
+    sys.stderr.write(f"\n  wrote {len(enriched):,} rows -> {args.out}\n")
+
+    if args.write_db:
+        from lib.db import get_engine
+        from lib.http import get_secret
+
+        if not get_secret("DATABASE_URL"):
+            sys.exit(
+                "ERROR: --write-db was given but DATABASE_URL is not set. "
+                "Copy .env.example -> .env and fill it in."
+            )
+
+        engine = get_engine()
+        n_written = upsert_enrich_irs990(engine, enriched)
+        sys.stderr.write(
+            f"  irs_990_enrich: wrote {n_written:,} rows to staging.enrich_irs990\n"
+        )
+
+
+if __name__ == "__main__":
+    main()

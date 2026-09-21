@@ -265,16 +265,18 @@ class TestToCanonical:
         missing = set(CANONICAL_COLUMNS) - set(out.columns)
         assert not missing, f"Missing columns: {missing}"
 
-    def test_source_id_prefixed_with_nsd(self):
-        """source_id must be 'nsd:' + PERMANENT_IDENTIFIER."""
+    def test_source_id_is_constant_usgs_nsd(self):
+        """D3: source_id must be the constant 'usgs_nsd', not a per-row composite."""
         df = _make_raw(PERMANENT_IDENTIFIER="abc123-uuid")
         out = mod.to_canonical(mod.normalize(df))
-        assert out["source_id"].iloc[0] == "nsd:abc123-uuid"
+        assert out["source_id"].iloc[0] == "usgs_nsd"
 
-    def test_source_id_uses_permanent_identifier_as_suffix(self):
+    def test_source_id_does_not_embed_permanent_identifier(self):
+        """D3: source_id is a constant — PERMANENT_IDENTIFIER lives in natural_key only."""
         df = _make_raw(PERMANENT_IDENTIFIER="zzz999-uuid")
         out = mod.to_canonical(mod.normalize(df))
-        assert out["source_id"].iloc[0].endswith("zzz999-uuid")
+        assert out["source_id"].iloc[0] == "usgs_nsd"
+        assert "zzz999-uuid" not in out["source_id"].iloc[0]
 
     def test_vertical_is_deathcare(self):
         out = mod.to_canonical(self._normalized_df())

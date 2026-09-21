@@ -24,6 +24,8 @@ set here to exclude them at the merge layer without a separate filter pass.
 
 from __future__ import annotations
 
+import argparse
+import datetime
 import io
 import re
 import sys
@@ -37,6 +39,9 @@ from lib.schema import build_canonical
 from lib.validate import assert_columns_present, assert_min_rows
 
 # ---------------------------------------------------------------- constants
+
+# D3: source_id is a constant per source; the per-row id lives in natural_key.
+SOURCE_ID = "va_cemeteries"
 
 SOURCE_URL = "https://datahub.va.gov/api/views/fcxt-zc8r/rows.csv?accessType=DOWNLOAD"
 
@@ -141,6 +146,12 @@ def load_raw(path_or_url: str | None = None) -> pd.DataFrame:
     else:
         df = pd.read_csv(source, dtype=str)
 
+    # Socrata has since re-exported this dataset with Title Case headers
+    # ("Cemetery Name", "Burial Space") instead of the lowercase snake_case
+    # this connector was written against ("cemetery_name", "burial_space").
+    # Normalize so downstream column lookups keep working either way.
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
     df["source_file"] = SOURCE_URL
     return df
 
@@ -223,12 +234,14 @@ def report_quality(df: pd.DataFrame) -> None:
 
 def to_canonical(df: pd.DataFrame) -> pd.DataFrame:
     """Map normalized VA cemetery columns to the standard deathcare output shape."""
+    # D3: source_id is the constant SOURCE_ID; natural_key carries the per-row id.
+    # The per-row natural key uses the full state name (stable across renames) to
+    # match the original design; the name+state combo is the only stable identifier.
     natural_key = df["cemetery_name"] + "|" + df["state"]
-    source_id = "va:" + df["name_normalized"] + "|" + df["state_abbr"]
 
     return build_canonical(
         df.index,
-        source_id=source_id,
+        source_id=SOURCE_ID,
         natural_key=natural_key,
         vertical="deathcare",
         account_type="federal",
@@ -245,3 +258,106 @@ def to_canonical(df: pd.DataFrame) -> pd.DataFrame:
         segment="federal",
         source_file=df["source_file"],
     )
+
+
+# ---------------------------------------------------------------- entrypoint
+
+
+def main() -> None:
+    """CLI entrypoint — fetch VA cemetery data and optionally write to DB."""
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "--out",
+        default="va_cemeteries.csv",
+        help="Output CSV path (default: va_cemeteries.csv)",
+    )
+    ap.add_argument(
+        "--write-db",
+        action="store_true",
+        help="Also write results to Postgres staging (requires DATABASE_URL). "
+             "Off by default — the CSV is always written regardless.",
+    )
+    ap.add_argument(
+        "--input",
+        default=None,
+        metavar="PATH_OR_URL",
+        help="Local CSV path or URL to load instead of the live VA source. "
+             "Useful for testing or offline replay.",
+    )
+    args = ap.parse_args()
+
+    source = args.input or SOURCE_URL
+    sys.stderr.write(f"  va_cemeteries: loading {source}\n")
+
+    raw = load_raw(source)
+    assert_source_shape(raw)
+
+    normalized = normalize(raw)
+    report_quality(normalized)
+    canonical = to_canonical(normalized)
+
+    # Use the raw CSV bytes for the sha256 (or serialize if from URL).
+    import json as _json
+    raw_bytes = _json.dumps(
+        raw.to_dict(orient="records"), sort_keys=True
+    ).encode("utf-8")
+
+    canonical.to_csv(args.out, index=False)
+    sys.stderr.write(f"\n  wrote {len(canonical):,} records -> {args.out}\n")
+
+    if args.write_db:
+        from lib.db import get_engine, write_source_run, upsert_staging, finish_source_run
+        from lib.gcs import raw_sha256, upload_raw
+        from lib.http import get_secret
+
+        if not get_secret("DATABASE_URL"):
+            sys.exit(
+                "ERROR: --write-db was given but DATABASE_URL is not set. "
+                "Copy .env.example -> .env and fill it in."
+            )
+
+        sha256_hex = raw_sha256(raw_bytes)
+        byte_count = len(raw_bytes)
+        sys.stderr.write(
+            f"  va_cemeteries: sha256={sha256_hex[:16]}…  bytes={byte_count:,}\n"
+        )
+
+        run_date = datetime.date.today().isoformat()
+        raw_uri = upload_raw(SOURCE_ID, run_date, raw_bytes)
+
+        engine = get_engine()
+        source_run_id: int | None = None
+        try:
+            source_run_id = write_source_run(
+                engine,
+                source_id=SOURCE_ID,
+                byte_count=byte_count,
+                sha256=sha256_hex,
+                connector_version="1.0",
+                license_string="VA open data — public domain",
+                raw_uri=raw_uri,
+            )
+
+            upsert_staging(engine, SOURCE_ID, canonical)
+
+            finish_source_run(
+                engine,
+                source_run_id,
+                status="succeeded",
+                row_count=len(canonical),
+            )
+            sys.stderr.write(
+                f"  va_cemeteries: wrote {len(canonical):,} rows "
+                f"to staging.{SOURCE_ID} (source_run_id={source_run_id})\n"
+            )
+        except Exception as exc:
+            if source_run_id is not None:
+                finish_source_run(engine, source_run_id, status="failed")
+            sys.exit(f"ERROR: DB write failed — {exc}")
+
+
+if __name__ == "__main__":
+    main()

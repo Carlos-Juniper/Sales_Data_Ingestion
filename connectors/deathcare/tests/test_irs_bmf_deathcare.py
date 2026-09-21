@@ -345,20 +345,21 @@ class TestToCanonical:
         missing = set(CANONICAL_COLUMNS) - set(out.columns)
         assert not missing, f"Missing columns: {missing}"
 
-    def test_source_id_prefixed_with_irs_bmf(self):
+    def test_source_id_is_constant_irs_bmf_deathcare(self):
         """
-        CRITICAL: source_id must start with 'irs_bmf:', not 'nsd:' or bare EIN.
-        Prefix is the namespace key used during downstream deduplication.
+        D3: source_id must be the constant 'irs_bmf_deathcare', not a per-row composite.
+        The EIN lives in natural_key; the BMF prefix is preserved in merged_sources composites.
         """
         df = _make_raw(EIN="043783054")
         out = mod.to_canonical(mod.normalize(df))
-        assert out["source_id"].iloc[0] == "irs_bmf:043783054"
+        assert out["source_id"].iloc[0] == "irs_bmf_deathcare"
 
-    def test_source_id_preserves_leading_zeros_in_ein(self):
-        """EIN leading zeros must survive into source_id."""
+    def test_source_id_does_not_embed_ein(self):
+        """D3: source_id is a constant — EIN (with leading zeros) lives in natural_key only."""
         df = _make_raw(EIN="000000001")
         out = mod.to_canonical(mod.normalize(df))
-        assert out["source_id"].iloc[0] == "irs_bmf:000000001"
+        assert out["source_id"].iloc[0] == "irs_bmf_deathcare"
+        assert "000000001" not in out["source_id"].iloc[0]
 
     def test_natural_key_matches_ein(self):
         df = _make_raw(EIN="043783054")
