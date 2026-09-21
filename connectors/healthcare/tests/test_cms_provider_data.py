@@ -28,6 +28,7 @@ from healthcare.cms_provider_data import (
     load_raw,
     to_canonical,
 )
+from lib.enums import HEALTHCARE_TARGET_STATES
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -192,18 +193,30 @@ class TestIterDatastoreRows:
 
 class TestLoadRaw:
     def test_load_raw_returns_dataframe(self):
-        """load_raw wraps iter_datastore_rows and returns a DataFrame."""
+        """load_raw wraps iter_datastore_rows and returns (DataFrame, bytes)."""
         session = requests.Session()
         with patch(
             "requests.Session.get",
             return_value=_make_response(_DATASTORE_TWO_ROWS),
         ):
-            df = load_raw("abc123-uuid", session, page_size=1000)
+            df, raw_bytes = load_raw("abc123-uuid", session, page_size=1000)
 
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 2
         assert "CMS Certification Number (CCN)" in df.columns
         assert "Provider Name" in df.columns
+
+    def test_load_raw_returns_bytes(self):
+        """load_raw also returns the raw bytes for hashing (B4 / D7)."""
+        session = requests.Session()
+        with patch(
+            "requests.Session.get",
+            return_value=_make_response(_DATASTORE_TWO_ROWS),
+        ):
+            df, raw_bytes = load_raw("abc123-uuid", session, page_size=1000)
+
+        assert isinstance(raw_bytes, bytes)
+        assert len(raw_bytes) > 0
 
     def test_load_raw_empty_response_returns_empty_dataframe(self):
         """An empty API response yields an empty DataFrame (not an error)."""
@@ -212,7 +225,7 @@ class TestLoadRaw:
             "requests.Session.get",
             return_value=_make_response(_DATASTORE_EMPTY),
         ):
-            df = load_raw("abc123-uuid", session)
+            df, raw_bytes = load_raw("abc123-uuid", session)
 
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 0
@@ -247,7 +260,7 @@ class TestAssertSourceShape:
             "requests.Session.get",
             return_value=_make_response(_DATASTORE_TWO_ROWS),
         ):
-            df = load_raw("abc123-uuid", session)
+            df, _raw_bytes = load_raw("abc123-uuid", session)
 
         assert_source_shape(df)  # must not raise
 
@@ -339,15 +352,17 @@ class TestToCanonical:
         silently fills with "" for every row (confirmed live against
         xubh-q36u: 5,419/5,419 rows missing natural_key).
         """
+        # Use FL (in-scope) so the state filter inside to_canonical() does not
+        # drop the row — this test is about CCN resolution, not state filtering.
         df = pd.DataFrame(
             [
                 {
                     "facility_id": "010001",
                     "facility_name": "SOUTHEAST HEALTH MEDICAL CENTER",
                     "address": "1108 ROSS CLARK CIRCLE",
-                    "citytown": "DOTHAN",
-                    "state": "AL",
-                    "zip_code": "36301",
+                    "citytown": "GAINESVILLE",
+                    "state": "FL",
+                    "zip_code": "32601",
                 }
             ]
         )
@@ -396,3 +411,73 @@ _CANONICAL_COLS_EXPECTED = [
     "facility_type",
     "dataset_key",
 ]
+
+
+# ---------------------------------------------------------------------------
+# D10: state filter tests
+# ---------------------------------------------------------------------------
+
+
+def _make_cms_raw_df(state_rows: list[tuple[str, str]]) -> pd.DataFrame:
+    """
+    Build a minimal CMS-shaped raw DataFrame.
+
+    Each entry in state_rows is (ccn, state_abbr).  All other columns are
+    filled with plausible values so to_canonical() can resolve every hint.
+    """
+    return pd.DataFrame([
+        {
+            "CMS Certification Number (CCN)": ccn,
+            "Provider Name": f"Facility {ccn}",
+            "Address": "100 Main St",
+            "City/Town": "Anytown",
+            "State": state,
+            "ZIP Code": "00000",
+        }
+        for ccn, state in state_rows
+    ])
+
+
+class TestCmsStateFilter:
+    def test_out_of_state_rows_dropped_by_to_canonical(self):
+        """
+        to_canonical() must drop rows whose state is outside the 5 target states.
+
+        CA and NY are not in scope; FL and TX are.
+        """
+        df = _make_cms_raw_df([
+            ("11111", "FL"),
+            ("22222", "CA"),
+            ("33333", "TX"),
+            ("44444", "NY"),
+        ])
+        result = to_canonical(df, dataset_key="nursing_home")
+        assert set(result["site_state"]) == {"FL", "TX"}
+        assert len(result) == 2
+
+    def test_all_target_state_rows_kept(self):
+        """One row per target state — all five must survive to_canonical()."""
+        rows = [(f"0000{i}", s) for i, s in enumerate(sorted(HEALTHCARE_TARGET_STATES))]
+        df = _make_cms_raw_df(rows)
+        result = to_canonical(df, dataset_key="general")
+        assert set(result["site_state"]) == HEALTHCARE_TARGET_STATES
+        assert len(result) == 5
+
+    def test_all_out_of_state_returns_empty(self):
+        """When every CMS row is out-of-state, to_canonical() returns an empty DataFrame."""
+        df = _make_cms_raw_df([("11111", "CA"), ("22222", "OH"), ("33333", "AZ")])
+        result = to_canonical(df, dataset_key="nursing_home")
+        assert len(result) == 0
+
+    def test_filter_runs_inside_to_canonical_before_caller_can_geocode(self):
+        """
+        The filter is part of to_canonical() itself — the caller receives an
+        already-filtered DataFrame and cannot pass out-of-state rows to upsert_staging().
+
+        Regression: verifies that the filter position is inside to_canonical(),
+        not deferred to a separate step the caller could forget.
+        """
+        df = _make_cms_raw_df([("11111", "FL"), ("22222", "OR")])
+        result = to_canonical(df, dataset_key="nursing_home")
+        # OR must never appear in the output regardless of what the caller does next.
+        assert "OR" not in result["site_state"].values

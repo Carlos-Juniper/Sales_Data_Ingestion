@@ -23,6 +23,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
+import json
 import sys
 from pathlib import Path
 from typing import Generator, Iterator
@@ -31,8 +33,12 @@ import pandas as pd
 import requests
 import yaml
 
-from lib.http import make_session
-from lib.normalize import normalize_name, normalize_zip
+from lib.db import finish_source_run, get_engine, upsert_staging, write_source_run
+from lib.enums import HEALTHCARE_TARGET_STATES
+from lib.gcs import raw_sha256, upload_raw
+from lib.http import get_secret, make_session
+from lib.normalize import normalize_name, normalize_phone, normalize_zip
+from lib.schema import build_canonical
 
 # ---------------------------------------------------------------- constants
 
@@ -64,11 +70,12 @@ _CCN_HINTS = ["ccn", "certification number", "provider id", "provider number", "
 # Substrings used to locate the facility name column.
 _NAME_HINTS = ["provider name", "facility name", "name"]
 
-# Substrings used to locate street address, city, state, ZIP columns.
+# Substrings used to locate street address, city, state, ZIP, phone columns.
 _ADDR_HINTS = ["address", "street"]
 _CITY_HINTS = ["city"]
 _STATE_HINTS = ["state"]
 _ZIP_HINTS = ["zip"]
+_PHONE_HINTS = ["phone", "telephone"]
 
 
 # ---------------------------------------------------------------- helpers
@@ -160,18 +167,28 @@ def load_raw(
     resource_id: str,
     session: requests.Session,
     page_size: int = 1000,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, bytes]:
     """
-    Pull all rows from the DKAN datastore and return a raw DataFrame.
+    Pull all rows from the DKAN datastore and return a raw DataFrame plus bytes.
+
+    The returned bytes are a deterministic JSON serialisation of the row list
+    with ``sort_keys=True`` — independent of pandas version and column order.
+    These are the canonical bytes hashed for B4/D7 (not a pandas re-serialisation).
 
     Column names are exactly as returned by the API; no renaming occurs here.
+
+    Returns:
+        (DataFrame of raw rows, JSON bytes of those rows with sort_keys=True)
     """
     rows = list(iter_datastore_rows(resource_id, session, page_size=page_size))
     print(
         f"  cms_provider_data: loaded {len(rows):,} rows into DataFrame",
         file=sys.stderr,
     )
-    return pd.DataFrame(rows)
+    # Serialise to JSON with sort_keys=True for determinism across runs and
+    # pandas versions (fixes B4 — raw.to_json() column order varies).
+    raw_bytes = json.dumps(rows, sort_keys=True, default=str).encode("utf-8")
+    return pd.DataFrame(rows), raw_bytes
 
 
 # ---------------------------------------------------------------- checks
@@ -248,7 +265,18 @@ def to_canonical(df: pd.DataFrame, dataset_key: str) -> pd.DataFrame:
     else:
         facility_type = pd.Series([dataset_key] * len(df), dtype=str)
 
-    return pd.DataFrame({
+    # Phone — CMS datasets often expose a phone/telephone column; carry it
+    # through so the pipeline can populate resolved_account.phone and
+    # resolved_contact.phone.  Returns an empty Series when no phone column
+    # is found (the hint search returns None), which normalize_phone maps to "".
+    phone_col = _find_column(cols, _PHONE_HINTS)
+    if phone_col:
+        phone_raw = df[phone_col].fillna("").astype(str).str.strip()
+    else:
+        phone_raw = pd.Series([""] * len(df), dtype=str)
+    phone_normalized = phone_raw.map(normalize_phone)
+
+    result = pd.DataFrame({
         "natural_key": natural_key,
         "name_raw": name_raw,
         "address_line_1": address_line_1,
@@ -257,7 +285,24 @@ def to_canonical(df: pd.DataFrame, dataset_key: str) -> pd.DataFrame:
         "zip5": zip5,
         "facility_type": facility_type,
         "dataset_key": dataset_key,
+        "phone_raw": phone_raw,
+        "phone_normalized": phone_normalized,
     })
+
+    # D10: filter to the 5 target states as early as possible in row-building —
+    # before report_quality(), build_canonical(), and upsert_staging() — so that
+    # out-of-state rows never reach geocoding or the database.
+    # State column is site_state (already uppercased above via .str.upper()).
+    before = len(result)
+    result = result[result["site_state"].isin(HEALTHCARE_TARGET_STATES)].copy()
+    after = len(result)
+    print(
+        f"  cms_provider_data: state filter ({'/'.join(sorted(HEALTHCARE_TARGET_STATES))}): "
+        f"{before:,} -> {after:,} rows",
+        file=sys.stderr,
+    )
+
+    return result
 
 
 # ---------------------------------------------------------------- quality
@@ -321,6 +366,12 @@ def main() -> None:
         default=1000,
         help="Rows per API page (default: 1000)",
     )
+    ap.add_argument(
+        "--write-db",
+        action="store_true",
+        help="Also write results to Postgres staging (requires DATABASE_URL). "
+             "Off by default — the CSV is always written regardless.",
+    )
     args = ap.parse_args()
 
     dataset_cfg = config[args.dataset]
@@ -337,14 +388,90 @@ def main() -> None:
 
     # dataset_id doubles as the datastore resource id — verified live against
     # both configured datasets, no separate metastore resolution needed.
-    raw = load_raw(dataset_id, session, page_size=args.page_size)
+    raw, raw_bytes = load_raw(dataset_id, session, page_size=args.page_size)
     assert_source_shape(raw)
+
+    # B4 fix: hash the actual fetched bytes (JSON-serialised with sort_keys=True),
+    # not a pandas re-serialisation which varies by version and column order.
+    sha256_hex = raw_sha256(raw_bytes)
+    byte_count = len(raw_bytes)
+    print(
+        f"  cms_provider_data: sha256={sha256_hex[:16]}…  bytes={byte_count:,}",
+        file=sys.stderr,
+    )
 
     canonical = to_canonical(raw, dataset_key=args.dataset)
     report_quality(canonical)
 
     canonical.to_csv(out_path, index=False)
     print(f"\n  wrote {len(canonical):,} records -> {out_path}", file=sys.stderr)
+
+    # Write to Postgres only when explicitly requested via --write-db.
+    # The presence of DATABASE_URL alone must not trigger writes: the same
+    # env var can point at local docker or, via the Auth Proxy, at Cloud SQL.
+    if args.write_db:
+        if not get_secret("DATABASE_URL"):
+            sys.exit(
+                "ERROR: --write-db was given but DATABASE_URL is not set. "
+                "Copy .env.example -> .env and fill it in."
+            )
+        source_id = f"cms_{args.dataset}"
+
+        # D7: upload raw payload to GCS before writing the source_run row so
+        # the URI is available to persist.  Returns None when GCS is disabled
+        # or unavailable — never raises.
+        run_date = datetime.date.today().isoformat()
+        raw_uri = upload_raw(source_id, run_date, raw_bytes)
+
+        engine = get_engine()
+        source_run_id: int | None = None
+        try:
+            source_run_id = write_source_run(
+                engine,
+                source_id=source_id,
+                byte_count=byte_count,
+                sha256=sha256_hex,
+                connector_version="1.0",
+                license_string="CMS public data — no license restrictions",
+                raw_uri=raw_uri,
+            )
+
+            # Build full CANONICAL_COLUMNS DataFrame from the CMS local canonical.
+            full_canonical = build_canonical(
+                canonical.index,
+                source_id=source_id,
+                natural_key=canonical["natural_key"],
+                vertical="healthcare",
+                account_type=canonical["facility_type"],
+                name_raw=canonical["name_raw"],
+                name_normalized=canonical["name_raw"].map(normalize_name),
+                address_line_1=canonical["address_line_1"],
+                city=canonical["city"],
+                state=canonical["site_state"],
+                zip5=canonical["zip5"],
+                phone_raw=canonical["phone_raw"],
+                phone_normalized=canonical["phone_normalized"],
+                source_file=dataset_id,
+            )
+
+            upsert_staging(engine, source_id, full_canonical)
+
+            finish_source_run(
+                engine,
+                source_run_id,
+                status="succeeded",
+                row_count=len(full_canonical),
+            )
+            print(
+                f"  cms_provider_data: wrote {len(full_canonical):,} rows "
+                f"to staging.{source_id} (source_run_id={source_run_id})",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            if source_run_id is not None:
+                finish_source_run(engine, source_run_id, status="failed")
+            print(f"  cms_provider_data: DB write failed — {exc}", file=sys.stderr)
+            raise
 
 
 if __name__ == "__main__":

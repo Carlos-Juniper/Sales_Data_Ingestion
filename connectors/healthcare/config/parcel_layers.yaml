@@ -138,6 +138,51 @@ county:
       parcel_id_field: PROP_ID
       owner_field: OWNER_NAME
 
+    # Galveston
+    # TODO: validate against live endpoint before first production run
+    "48167":
+      url: "https://gis.galvestoncad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+      area_field: LAND_SQFT
+      area_unit: sqft
+      parcel_id_field: PROP_ID
+      owner_field: OWNER_NAME
+
+    # Brazoria (Pearland/Alvin)
+    # TODO: validate against live endpoint before first production run
+    "48039":
+      url: "https://gis.brazoriacad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+      area_field: LAND_SQFT
+      area_unit: sqft
+      parcel_id_field: GEO_ID
+      owner_field: OWNER_NAME
+
+    # Hidalgo (McAllen/Rio Grande Valley)
+    # TODO: validate against live endpoint before first production run
+    "48215":
+      url: "https://gis.hidalgocad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+      area_field: LAND_SQFT
+      area_unit: sqft
+      parcel_id_field: PROP_ID
+      owner_field: OWNER_NAME
+
+    # El Paso
+    # TODO: validate against live endpoint before first production run
+    "48141":
+      url: "https://gis.epcad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+      area_field: LAND_SQFT
+      area_unit: sqft
+      parcel_id_field: ACCOUNT_NUM
+      owner_field: OWNER1
+
+    # Nueces (Corpus Christi)
+    # TODO: validate against live endpoint before first production run
+    "48355":
+      url: "https://gis.nuecescad.org/arcgis/rest/services/Parcels/FeatureServer/0"
+      area_field: LAND_SQFT
+      area_unit: sqft
+      parcel_id_field: PROP_ID
+      owner_field: OWNER_NAME
+
   PA:
     # Philadelphia
     # TODO: validate against live endpoint before first production run

@@ -28,15 +28,21 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import sys
 from pathlib import Path
 
 import pandas as pd
 
-from lib.normalize import normalize_zip
+from lib.db import finish_source_run, get_engine, upsert_staging, write_source_run
+from lib.enums import HEALTHCARE_TARGET_STATES
+from lib.gcs import raw_sha256, upload_raw
+from lib.http import get_secret
+from lib.normalize import normalize_name, normalize_phone, normalize_zip
+from lib.schema import build_canonical
 
-SOURCE_ID = "nppes_pl"
+SOURCE_ID = "nppes_practice_locations"
 VERTICAL = "healthcare"
 
 # Entity type "2" = Organization
@@ -265,6 +271,33 @@ def normalize_and_join(main_df: pd.DataFrame, pl_df: pd.DataFrame) -> pd.DataFra
         _PL_COL_STATE:                                           "site_state",
     })
 
+    # Phone: the pl_ file carries a per-location telephone number.
+    # Normalize to digits-only (10+ digits) via normalize_phone so the pipeline
+    # can coalesce phone across cluster members in survivorship.
+    # Guard: unit-test DataFrames built without the full pl_ schema may omit
+    # _PL_COL_PHONE — fall back to an empty Series so tests don't KeyError.
+    if _PL_COL_PHONE in joined.columns:
+        phone_raw_series = joined[_PL_COL_PHONE].fillna("").astype(str).str.strip()
+    else:
+        phone_raw_series = pd.Series("", index=joined.index, dtype=str)
+    out["phone_raw"] = phone_raw_series
+    out["phone_normalized"] = out["phone_raw"].map(normalize_phone)
+
+    # D10: filter to the 5 target states immediately after join — before
+    # report_quality(), build_canonical(), and upsert_staging().  This matters
+    # for cost/time: NPPES is ~9.7M rows before any filtering, and every
+    # out-of-state row would otherwise be geocoded at ~1 req/sec.
+    # State column is site_state (raw 2-letter code from the pl_ file, uppercase).
+    before = len(out)
+    out = out[out["site_state"].isin(HEALTHCARE_TARGET_STATES)].copy()
+    after = len(out)
+    print(
+        f"  nppes_practice_locations: state filter "
+        f"({'/'.join(sorted(HEALTHCARE_TARGET_STATES))}): "
+        f"{before:,} -> {after:,} rows",
+        file=sys.stderr,
+    )
+
     return out[[
         "natural_key",
         "npi",
@@ -275,6 +308,8 @@ def normalize_and_join(main_df: pd.DataFrame, pl_df: pd.DataFrame) -> pd.DataFra
         "site_state",
         "zip5",
         "taxonomy_primary",
+        "phone_raw",
+        "phone_normalized",
     ]]
 
 
@@ -337,6 +372,12 @@ def main() -> None:
         default="nppes_practice_locations.csv",
         help="output CSV path (default: nppes_practice_locations.csv)",
     )
+    ap.add_argument(
+        "--write-db",
+        action="store_true",
+        help="Also write results to Postgres staging (requires DATABASE_URL). "
+             "Off by default — the CSV is always written regardless.",
+    )
     args = ap.parse_args()
 
     # Resolve globs — exactly one file must match each pattern.
@@ -370,12 +411,89 @@ def main() -> None:
     print("\njoining and normalizing...", file=sys.stderr)
     result = normalize_and_join(main_df, pl_df)
 
+    # B4 fix: hash actual file bytes, not a pandas re-serialisation.
+    # Both source files are included to detect any upstream change in either.
+    # Canonical payload = pl_file_bytes + b"\x00" + main_file_bytes (null separator
+    # for determinism; order: pl_ first as the primary output driver).
+    # byte_count reflects this combined payload size.
+    pl_file_bytes = Path(pl_path).read_bytes()
+    main_file_bytes = Path(main_path).read_bytes()
+    raw_bytes = pl_file_bytes + b"\x00" + main_file_bytes
+    sha256_hex = raw_sha256(raw_bytes)
+    byte_count = len(raw_bytes)
+    print(
+        f"  nppes_practice_locations: sha256={sha256_hex[:16]}…  bytes={byte_count:,}",
+        file=sys.stderr,
+    )
+
     # --- Quality report ---
     report_quality(result)
 
     # --- Load ---
     result.to_csv(args.out, index=False)
     print(f"\nwrote {len(result):,} rows -> {args.out}", file=sys.stderr)
+
+    # Write to Postgres only when explicitly requested via --write-db.
+    if args.write_db:
+        if not get_secret("DATABASE_URL"):
+            sys.exit(
+                "ERROR: --write-db was given but DATABASE_URL is not set. "
+                "Copy .env.example -> .env and fill it in."
+            )
+
+        # D7: upload raw payload to GCS before writing source_run.
+        # Returns None when GCS is disabled/unavailable — never raises.
+        run_date = datetime.date.today().isoformat()
+        raw_uri = upload_raw(SOURCE_ID, run_date, raw_bytes)
+
+        engine = get_engine()
+        source_run_id: int | None = None
+        try:
+            source_run_id = write_source_run(
+                engine,
+                source_id=SOURCE_ID,
+                byte_count=byte_count,
+                sha256=sha256_hex,
+                connector_version="1.0",
+                license_string="NPPES Data Dissemination — public domain, U.S. Department of Health & Human Services",
+                raw_uri=raw_uri,
+            )
+
+            full_canonical = build_canonical(
+                result.index,
+                source_id=SOURCE_ID,
+                natural_key=result["natural_key"],
+                vertical=VERTICAL,
+                account_type=result["taxonomy_primary"],
+                name_raw=result["name_raw"],
+                name_normalized=result["name_raw"].map(normalize_name),
+                address_line_1=result["address_line_1"],
+                city=result["city"],
+                state=result["site_state"],
+                zip5=result["zip5"],
+                phone_raw=result["phone_raw"],
+                phone_normalized=result["phone_normalized"],
+                source_file=pl_path,
+            )
+
+            upsert_staging(engine, SOURCE_ID, full_canonical)
+
+            finish_source_run(
+                engine,
+                source_run_id,
+                status="succeeded",
+                row_count=len(full_canonical),
+            )
+            print(
+                f"  nppes_practice_locations: wrote {len(full_canonical):,} rows "
+                f"to staging.{SOURCE_ID} (source_run_id={source_run_id})",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            if source_run_id is not None:
+                finish_source_run(engine, source_run_id, status="failed")
+            print(f"  nppes_practice_locations: DB write failed — {exc}", file=sys.stderr)
+            raise
 
 
 if __name__ == "__main__":
