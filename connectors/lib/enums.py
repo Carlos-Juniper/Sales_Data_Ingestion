@@ -32,3 +32,25 @@ ENRICH_SKIPPED = "skipped"
 CONFIDENCE_HIGH = "high"
 CONFIDENCE_SPATIAL_ONLY = "spatial_only"
 CONFIDENCE_NONE = "none"
+
+# ---------------------------------------------------------------------------
+# Healthcare pipeline scope (D10)
+# ---------------------------------------------------------------------------
+# Single source of truth for the 5 states in scope for healthcare ingestion.
+# All three healthcare connectors (va_facilities, cms_provider_data,
+# nppes_practice_locations) import this constant and apply it as a .isin()
+# filter as early as possible in row-building — before geocoding and before
+# upsert_staging() — so that out-of-state rows never reach downstream steps.
+HEALTHCARE_TARGET_STATES: frozenset[str] = frozenset({"FL", "NC", "TX", "PA", "SC"})
+
+# ---------------------------------------------------------------------------
+# Parks pipeline scope (D10)
+# ---------------------------------------------------------------------------
+# Same 5-state footprint as healthcare. All parks connectors import this constant
+# and apply it as an early .isin() filter on the state column.
+PARKS_TARGET_STATES: frozenset[str] = frozenset({"FL", "NC", "TX", "PA", "SC"})
+
+# ---------------------------------------------------------------------------
+# Segment values — parks extension
+# ---------------------------------------------------------------------------
+SEGMENT_STATE = "state"

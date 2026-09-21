@@ -9,6 +9,7 @@ env/
 # Environment / secrets
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 
@@ -25,3 +26,16 @@ env/
 *.gpkg
 output/
 data/
+
+
+outputs/
+
+# Connector dry-run output. `data/` and `outputs/` are already ignored, but the
+# per-source CSVs land next to the code when --out-dir defaults to the cwd, and
+# padus_parks.csv alone is 16.8 MB. Prefer --out-dir outputs/.
+connectors/*.csv
+
+# Standalone sales/territory analysis — internal business spreadsheets and a
+# generated geocode cache. Not part of the ingestion pipeline.
+market-analysis/
+branch_geocode_cache.json

@@ -1,0 +1,29 @@
+services:
+  postgres:
+    # imresamu/postgis is the only PG18 + PostGIS 3.5 image with a native
+    # arm64 build (postgis/postgis publishes amd64 only, and has no 18-3.4
+    # tag). PostGIS 3.5 matches the Cloud SQL instance (3.5.2).
+    image: imresamu/postgis:18-3.5-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Local Postgres stays on 5432; the Cloud SQL Auth Proxy runs on 5433 so
+    # the two never both answer the same DATABASE_URL (both bind 127.0.0.1,
+    # same ingest_app/ingestion identity — otherwise indistinguishable).
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # PG18 moved the default PGDATA to /var/lib/postgresql/18/docker and
+      # declares the VOLUME at /var/lib/postgresql (with a data -> . symlink).
+      # Mount the whole tree so the cluster persists; overriding PGDATA to the
+      # old /data path makes initdb see the non-empty parent and refuse.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:

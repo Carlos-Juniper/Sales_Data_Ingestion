@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "arcgis-ingest-connectors"
+version = "0.1.0"
+description = "ArcGIS data-ingestion connectors for the Juniper pipeline"
+requires-python = ">=3.13"
+dependencies = [
+    "pandas>=2.0,<3",
+    "psycopg[binary]>=3.1",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "rapidfuzz>=3.0",
+    "requests>=2.31",
+    "sqlalchemy>=2.0",
+    "urllib3>=2.0",
+]
+
+[tool.setuptools.packages.find]
+# Treat connectors/ as the package root so that `from lib import ...` and
+# `from healthcare import ...` resolve without setting PYTHONPATH.
+where = ["connectors"]
+
+[tool.pytest.ini_options]
+# pytest.ini at the repo root also registers this marker; this block ensures
+# pyproject.toml users see it too.
+markers = [
+    "integration: marks tests that require a live Postgres instance (skip with -m 'not integration')",
+]

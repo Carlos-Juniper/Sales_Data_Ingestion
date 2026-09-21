@@ -133,6 +133,37 @@ STATE_NAME_TO_ABBR: dict[str, str] = {
 }
 
 
+# Two-digit state FIPS code -> 2-letter abbreviation.
+# Census TIGERweb layers return the numeric FIPS code in their STATE field, not a
+# postal abbreviation, so every TIGER-sourced connector needs this to populate the
+# canonical `state` column (and to apply the *_TARGET_STATES filter, which is
+# expressed in abbreviations).
+#
+# Keys are strings, not ints: FIPS codes are zero-padded ("01", "06") and the
+# leading zero is significant.  ArcGIS returns them as strings; keep them that way
+# rather than round-tripping through int and losing the pad.
+STATE_FIPS_TO_ABBR: dict[str, str] = {
+    "01": "AL", "02": "AK", "04": "AZ", "05": "AR", "06": "CA",
+    "08": "CO", "09": "CT", "10": "DE", "11": "DC", "12": "FL",
+    "13": "GA", "15": "HI", "16": "ID", "17": "IL", "18": "IN",
+    "19": "IA", "20": "KS", "21": "KY", "22": "LA", "23": "ME",
+    "24": "MD", "25": "MA", "26": "MI", "27": "MN", "28": "MS",
+    "29": "MO", "30": "MT", "31": "NE", "32": "NV", "33": "NH",
+    "34": "NJ", "35": "NM", "36": "NY", "37": "NC", "38": "ND",
+    "39": "OH", "40": "OK", "41": "OR", "42": "PA", "44": "RI",
+    "45": "SC", "46": "SD", "47": "TN", "48": "TX", "49": "UT",
+    "50": "VT", "51": "VA", "53": "WA", "54": "WV", "55": "WI",
+    "56": "WY",
+    # Inhabited territories that appear in federal datasets.
+    "60": "AS", "66": "GU", "69": "MP", "72": "PR", "78": "VI",
+}
+
+# Reverse lookup, derived so the two can never drift apart.  Used to build the
+# numeric STATE IN (...) clauses that TIGERweb WHERE filters require from a
+# vertical's abbreviation-based TARGET_STATES frozenset.
+STATE_ABBR_TO_FIPS: dict[str, str] = {v: k for k, v in STATE_FIPS_TO_ABBR.items()}
+
+
 # ---------------------------------------------------------------- clustering
 
 def cluster_within_radius(

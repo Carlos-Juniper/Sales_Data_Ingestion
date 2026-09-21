@@ -120,6 +120,36 @@ def spatial_point_lookup(
     return _run("esriGeometryEnvelope", envelope)
 
 
+# Query keys that iter_features owns outright.  extra_params may not set these:
+# overriding orderByFields, resultOffset or resultRecordCount would corrupt
+# pagination in ways that show up as silently missing or duplicated rows rather
+# than as an error, which is the worst possible failure mode for an ingest.
+_RESERVED_QUERY_PARAMS: frozenset[str] = frozenset({
+    "f", "where", "outfields", "returngeometry", "outsr",
+    "resultoffset", "resultrecordcount", "orderbyfields", "objectids",
+    "returnidsonly",
+})
+
+
+def _sanitize_extra_params(
+    extra_params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Drop any reserved key from *extra_params*, warning on each one dropped."""
+    if not extra_params:
+        return {}
+    safe: dict[str, Any] = {}
+    for key, value in extra_params.items():
+        if key.lower() in _RESERVED_QUERY_PARAMS:
+            print(
+                f"  arcgis: ignoring reserved extra_params key {key!r} — "
+                f"iter_features controls this parameter",
+                file=sys.stderr,
+            )
+            continue
+        safe[key] = value
+    return safe
+
+
 def iter_features(
     base_url: str,
     where: str = "1=1",
@@ -127,39 +157,64 @@ def iter_features(
     max_record_count: int | None = None,
     order_by: str = "OBJECTID",
     return_geometry: bool = True,
+    response_format: str = "geojson",
     session: requests.Session | None = None,
     token: str | None = None,
     timeout: int = _DEFAULT_TIMEOUT,
+    extra_params: dict[str, Any] | None = None,
 ) -> Generator[dict[str, Any], None, None]:
     """
-    Paginate through all features in a layer, yielding one GeoJSON feature at a time.
+    Paginate through all features in a layer, yielding one feature dict at a time.
 
     Always sets orderByFields — unordered offset paging silently duplicates and
     drops rows when the server re-sorts between pages.
 
     When the layer reports supportsPagination=False, falls back to fetching all
     OBJECTIDs first and querying in ID-range chunks.
+
+    response_format: "geojson" (default) or "json". Use "json" for services that
+    claim geojson support but silently return 0 features — the result dicts use
+    "attributes" instead of "properties", handled transparently by feature_props().
+
+    extra_params: additional query parameters merged into every page request.
+    Cannot override the pagination-critical keys (f, where, outFields,
+    returnGeometry, outSR, resultOffset, resultRecordCount, orderByFields) —
+    those are dropped with a warning, because silently overriding orderByFields
+    or resultOffset would corrupt paging.
+
+    The parameters this exists for are server-side geometry reduction:
+
+        geometryPrecision   — decimal places to round coordinates to
+        maxAllowableOffset  — server-side generalization, in outSR units
+
+    Census TIGERweb serves full-resolution boundaries: 250 counties with geometry
+    is a 30 MB response, and the service returns HTTP 500 on large pages. Setting
+    geometryPrecision=6 with maxAllowableOffset=0.00003 (~3 m) brings the same
+    page down to 5.8 MB. Reducing on the server is strictly better than fetching
+    full resolution and simplifying afterwards.
     """
     s = session or make_session()
 
     if max_record_count is None:
         info = get_layer_info(base_url, session=s, token=token, timeout=timeout)
-        max_record_count = info.get("maxRecordCount", 1000)
+        max_record_count = info.get("maxRecordCount") or 1000
         supports_pagination = (
             info.get("advancedQueryCapabilities", {}).get("supportsPagination", True)
         )
     else:
         supports_pagination = True
 
+    safe_extra = _sanitize_extra_params(extra_params)
+
     if supports_pagination:
         yield from _iter_offset(
             base_url, where, out_fields, max_record_count, order_by,
-            return_geometry, s, token, timeout,
+            return_geometry, response_format, s, token, timeout, safe_extra,
         )
     else:
         yield from _iter_by_ids(
             base_url, where, out_fields, max_record_count,
-            return_geometry, s, token, timeout,
+            return_geometry, response_format, s, token, timeout, safe_extra,
         )
 
 
@@ -170,13 +225,17 @@ def _iter_offset(
     page_size: int,
     order_by: str,
     return_geometry: bool,
+    response_format: str,
     session: requests.Session,
     token: str | None,
     timeout: int,
+    extra_params: dict[str, Any] | None = None,
 ) -> Generator[dict[str, Any], None, None]:
     offset = 0
     while True:
         params: dict[str, Any] = {
+            **(extra_params or {}),
+            "f": response_format,
             "where": where,
             "outFields": out_fields,
             "returnGeometry": str(return_geometry).lower(),
@@ -190,8 +249,15 @@ def _iter_offset(
         # Yield first so the caller receives every feature from this page before
         # we decide whether to continue.
         yield from features
-        # Normal exit: server says the last page was fully transferred.
-        if not result.get("exceededTransferLimit", False):
+        # exceededTransferLimit is an Esri-JSON-only field — a geojson response
+        # (our default _raw_query format) never includes it, so it comes back
+        # as None here rather than False. Treat None as "unknown" and fall back
+        # to the page-was-full heuristic instead of silently stopping after
+        # page 1, which was truncating every layer larger than one page.
+        exceeded = result.get("exceededTransferLimit")
+        if exceeded is None:
+            exceeded = len(features) >= page_size
+        if not exceeded:
             break
         # Advance offset by the number of features just received so the next
         # request starts exactly where this one left off.
@@ -213,9 +279,11 @@ def _iter_by_ids(
     out_fields: str,
     chunk_size: int,
     return_geometry: bool,
+    response_format: str,
     session: requests.Session,
     token: str | None,
     timeout: int,
+    extra_params: dict[str, Any] | None = None,
 ) -> Generator[dict[str, Any], None, None]:
     """Fallback: fetch all OBJECTIDs first, then query in chunks."""
     id_result = _raw_query(
@@ -230,6 +298,8 @@ def _iter_by_ids(
         chunk = object_ids[i : i + chunk_size]
         id_filter = ",".join(str(oid) for oid in chunk)
         params: dict[str, Any] = {
+            **(extra_params or {}),
+            "f": response_format,
             "objectIds": id_filter,
             "outFields": out_fields,
             "returnGeometry": str(return_geometry).lower(),
