@@ -276,20 +276,18 @@ class TestToCanonical:
         missing = set(CANONICAL_COLUMNS) - set(out.columns)
         assert not missing, f"Missing columns: {missing}"
 
-    def test_source_id_prefixed_with_txdot(self):
-        """
-        CRITICAL: source_id must be 'txdot:' + integer string of GID.
-        GID=2.0 → source_id='txdot:2', not 'txdot:2.0'.
-        """
+    def test_source_id_is_constant_txdot_cemeteries(self):
+        """D3: source_id must be the constant 'txdot_cemeteries', not a per-row composite."""
         df = _make_raw(GID=2.0)
         out = mod.to_canonical(mod.normalize(df))
-        assert out["source_id"].iloc[0] == "txdot:2"
+        assert out["source_id"].iloc[0] == "txdot_cemeteries"
 
-    def test_source_id_uses_integer_string_not_float(self):
-        """source_id must not contain a decimal point from the GID double field."""
+    def test_source_id_does_not_embed_gid(self):
+        """D3: source_id is a constant — it must not contain the GID or a colon."""
         df = _make_raw(GID=42.0)
         out = mod.to_canonical(mod.normalize(df))
-        assert "." not in out["source_id"].iloc[0]
+        assert ":" not in out["source_id"].iloc[0]
+        assert "42" not in out["source_id"].iloc[0]
 
     def test_natural_key_is_integer_string_of_gid(self):
         """
