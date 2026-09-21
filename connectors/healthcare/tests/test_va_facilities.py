@@ -18,12 +18,15 @@ import pytest
 import requests
 
 from healthcare.va_facilities import (
+    _TARGET_STATES,
     assert_source_shape,
     fetch_all_facilities,
+    filter_to_target_states,
     load_raw,
     normalize,
     to_canonical,
 )
+from lib.enums import HEALTHCARE_TARGET_STATES
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -168,12 +171,12 @@ class TestFetchAllFacilities:
 
 class TestLoadRaw:
     def test_load_raw_returns_dataframe_with_expected_columns(self):
-        """load_raw should flatten nested attributes into a flat DataFrame."""
+        """load_raw should flatten nested attributes into a flat DataFrame plus bytes."""
         payload = _single_page_response([_TAMPA_FACILITY, _HOUSTON_FACILITY])
 
         with patch("requests.Session.get", return_value=_make_response(payload)):
             session = requests.Session()
-            df = load_raw(session, api_key="test-key")
+            df, raw_bytes = load_raw(session, api_key="test-key")
 
         expected_columns = {
             "id", "name", "facilityType", "address1",
@@ -188,7 +191,7 @@ class TestLoadRaw:
 
         with patch("requests.Session.get", return_value=_make_response(payload)):
             session = requests.Session()
-            df = load_raw(session, api_key="test-key")
+            df, _raw_bytes = load_raw(session, api_key="test-key")
 
         row = df.iloc[0]
         assert row["address1"] == "13000 Bruce B Downs Blvd"
@@ -202,9 +205,25 @@ class TestLoadRaw:
 
         with patch("requests.Session.get", return_value=_make_response(payload)):
             session = requests.Session()
-            df = load_raw(session, api_key="test-key")
+            df, _raw_bytes = load_raw(session, api_key="test-key")
 
         assert df.iloc[0]["operating_status_code"] == "NORMAL"
+
+    def test_load_raw_returns_bytes_of_original_api_objects(self):
+        """load_raw raw_bytes should be a deterministic JSON serialisation."""
+        import json
+
+        payload = _single_page_response([_TAMPA_FACILITY])
+
+        with patch("requests.Session.get", return_value=_make_response(payload)):
+            session = requests.Session()
+            _df, raw_bytes = load_raw(session, api_key="test-key")
+
+        assert isinstance(raw_bytes, bytes)
+        # Must be valid JSON and contain the facility id.
+        parsed = json.loads(raw_bytes)
+        assert isinstance(parsed, list)
+        assert any(f.get("id") == "vha_402" for f in parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -352,11 +371,17 @@ class TestToCanonical:
         return normalize(raw)
 
     def test_to_canonical_maps_columns_correctly(self):
-        """Output DataFrame must contain exactly the expected canonical columns."""
+        """Output DataFrame must contain exactly the expected canonical columns.
+
+        D17a: phone_raw and phone_normalized are now included so the pipeline
+        can carry VA facility phone numbers into resolved_account.phone and
+        resolved_contact.phone.
+        """
         expected_columns = {
             "natural_key", "name_raw", "address_line_1", "city",
             "site_state", "zip5", "latitude", "longitude",
             "facility_type", "operating_status",
+            "phone_raw", "phone_normalized",
         }
         df = self._normalized_df()
         result = to_canonical(df)
@@ -404,3 +429,94 @@ class TestMainApiKeyGuard:
                 import sys
                 sys.argv = ["va_facilities.py", "--out", "/dev/null"]
                 main()
+
+
+# ---------------------------------------------------------------------------
+# D10: state filter + shared constant tests
+# ---------------------------------------------------------------------------
+
+
+def _make_normalized_df(states: list[str]) -> pd.DataFrame:
+    """
+    Build a post-normalize() shaped DataFrame with one row per state.
+
+    All required columns are present so filter_to_target_states() and
+    to_canonical() can operate on the result without KeyError.
+    """
+    n = len(states)
+    raw = pd.DataFrame({
+        "id": [f"vha_{i}" for i in range(n)],
+        "name": ["Test Facility"] * n,
+        "facilityType": ["va_health_facility"] * n,
+        "address1": ["123 Main St"] * n,
+        "city": ["Test City"] * n,
+        "state": states,
+        "zip": ["33612"] * n,
+        "lat": [28.0] * n,
+        "long": [-82.0] * n,
+        "operating_status_code": ["NORMAL"] * n,
+    })
+    return normalize(raw)
+
+
+class TestFilterToTargetStates:
+    def test_out_of_state_rows_are_dropped(self):
+        """Rows whose state_abbr is not in the 5 target states must be removed."""
+        df = _make_normalized_df(["FL", "CA", "TX", "NY", "PA"])
+        result = filter_to_target_states(df)
+        # CA and NY are out-of-scope; FL, TX, PA are kept.
+        assert set(result["state_abbr"]) == {"FL", "TX", "PA"}
+        assert len(result) == 3
+
+    def test_all_target_state_rows_are_kept(self):
+        """One row per target state — all five must survive the filter."""
+        target_list = sorted(HEALTHCARE_TARGET_STATES)
+        df = _make_normalized_df(target_list)
+        result = filter_to_target_states(df)
+        assert len(result) == 5
+        assert set(result["state_abbr"]) == HEALTHCARE_TARGET_STATES
+
+    def test_empty_dataframe_returns_empty(self):
+        """An empty input (all rows filtered upstream) produces empty output without raising."""
+        # Build a normalized-shaped DataFrame with a state_abbr string column but
+        # zero rows — mirrors the real case where every row fails assert_source_shape
+        # or all API rows are out-of-scope.
+        df = _make_normalized_df(["CA"])           # 1 row so normalize() works
+        df = df.iloc[0:0].copy()                   # slice to 0 rows, keep dtypes
+        result = filter_to_target_states(df)
+        assert len(result) == 0
+
+    def test_all_rows_out_of_state_returns_empty(self):
+        """When every row is out-of-state, the result is an empty DataFrame."""
+        df = _make_normalized_df(["CA", "NY", "OH", "AZ"])
+        result = filter_to_target_states(df)
+        assert len(result) == 0
+
+    def test_filter_does_not_mutate_input(self):
+        """filter_to_target_states must return a copy, not modify the input."""
+        df = _make_normalized_df(["FL", "CA"])
+        original_len = len(df)
+        filter_to_target_states(df)
+        assert len(df) == original_len  # original unchanged
+
+
+class TestSharedConstant:
+    def test_target_states_alias_resolves_to_shared_constant(self):
+        """
+        va_facilities._TARGET_STATES must be the same object as
+        HEALTHCARE_TARGET_STATES — not a separate tuple copy (D10).
+        """
+        assert _TARGET_STATES is HEALTHCARE_TARGET_STATES
+
+    def test_target_states_contains_exactly_5_states(self):
+        """The healthcare scope is exactly FL, NC, TX, PA, SC — no more, no less."""
+        assert HEALTHCARE_TARGET_STATES == frozenset({"FL", "NC", "TX", "PA", "SC"})
+
+    def test_filter_uses_shared_constant_not_independent_copy(self):
+        """
+        Out-of-state rows (CA) are dropped and in-state rows (NC) are kept,
+        confirming the filter operates on HEALTHCARE_TARGET_STATES values.
+        """
+        df = _make_normalized_df(["NC", "CA"])
+        result = filter_to_target_states(df)
+        assert list(result["state_abbr"]) == ["NC"]

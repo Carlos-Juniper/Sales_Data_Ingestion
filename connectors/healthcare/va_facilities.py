@@ -38,6 +38,8 @@ separate approval step. Set VA_API_BASE_URL to override the host — e.g.:
 from __future__ import annotations
 
 import argparse
+import datetime
+import json
 import os
 import sys
 from typing import Generator
@@ -45,10 +47,17 @@ from typing import Generator
 import pandas as pd
 import requests
 
+from lib.db import finish_source_run, get_engine, upsert_staging, write_source_run
+from lib.enums import HEALTHCARE_TARGET_STATES
+from lib.gcs import raw_sha256, upload_raw
 from lib.http import get_secret, make_session
-from lib.normalize import normalize_zip
+from lib.normalize import normalize_name, normalize_phone, normalize_zip
+from lib.schema import build_canonical
 
 # ---------------------------------------------------------------- constants
+
+SOURCE_ID = "va_facilities"
+VERTICAL = "healthcare"
 
 PRODUCTION_BASE_URL = "https://api.va.gov/services/va_facilities/v1/facilities"
 SANDBOX_BASE_URL = "https://sandbox-api.va.gov/services/va_facilities/v1/facilities"
@@ -66,7 +75,9 @@ _KNOWN_FACILITY_TYPES = {
     "va_health_facility",
 }
 
-_TARGET_STATES = ("FL", "TX", "NC", "SC", "PA")
+# Alias the shared constant so report_quality() and any callers of _TARGET_STATES
+# stay readable without duplicating the tuple.  This is the single source of truth.
+_TARGET_STATES = HEALTHCARE_TARGET_STATES
 
 
 # ---------------------------------------------------------------- extract
@@ -117,19 +128,32 @@ def load_raw(
     session: requests.Session,
     api_key: str,
     per_page: int = 100,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, bytes]:
     """
-    Fetch all VA health facilities and return a raw DataFrame.
+    Fetch all VA health facilities and return a raw DataFrame plus raw bytes.
 
     Each row corresponds to one facility object as returned by the API.
     Nested attributes are flattened into individual columns here so that
     downstream stages work on a flat, predictable shape.
+
+    The raw bytes are the canonical JSON serialisation of the facility list
+    (sort_keys=True for determinism) — these are what get hashed and uploaded
+    to GCS (D7 / B4 fix).
+
+    Returns:
+        (DataFrame of flattened facility rows, JSON bytes of the raw facility list)
     """
+    raw_facilities = list(fetch_all_facilities(session, api_key, per_page=per_page))
+
     rows = []
-    for facility in fetch_all_facilities(session, api_key, per_page=per_page):
+    for facility in raw_facilities:
         attrs = facility.get("attributes", {})
         physical = attrs.get("address", {}).get("physical", {})
         operating_status = attrs.get("operatingStatus", {})
+        # VA Lighthouse API exposes attributes.phone.main for the main phone number.
+        # The phone object may be absent for some facilities — default to "".
+        phone_obj = attrs.get("phone") or {}
+        phone_main = str(phone_obj.get("main") or "").strip()
         rows.append({
             "id": facility.get("id"),
             "name": attrs.get("name"),
@@ -141,10 +165,15 @@ def load_raw(
             "lat": attrs.get("lat"),
             "long": attrs.get("long"),
             "operating_status_code": operating_status.get("code"),
+            "phone_main": phone_main,
         })
 
     print(f"  va_facilities: fetched {len(rows):,} raw records", file=sys.stderr)
-    return pd.DataFrame(rows)
+
+    # Serialise the original API objects (not the flattened rows) so the hash
+    # captures the full fidelity payload — sort_keys=True for determinism.
+    raw_bytes = json.dumps(raw_facilities, sort_keys=True, default=str).encode("utf-8")
+    return pd.DataFrame(rows), raw_bytes
 
 
 # ---------------------------------------------------------------- checks
@@ -205,7 +234,38 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     df["city_clean"] = df["city"].str.strip().fillna("")
     df["state_abbr"] = df["state"].str.strip().str.upper().fillna("")
 
+    # Normalize phone: phone_main is extracted by load_raw() from the API;
+    # it may be absent in unit-test DataFrames that don't go through load_raw().
+    # Use .get() with a fallback so existing tests that pass raw-shaped DataFrames
+    # directly to normalize() don't fail on the missing column.
+    phone_main_series = df["phone_main"] if "phone_main" in df.columns else pd.Series("", index=df.index)
+    df["phone_raw"] = phone_main_series.fillna("").astype(str).str.strip()
+    df["phone_normalized"] = df["phone_raw"].map(normalize_phone)
+
     return df
+
+
+# ---------------------------------------------------------------- state filter
+
+def filter_to_target_states(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop rows whose state_abbr is not in HEALTHCARE_TARGET_STATES (FL/NC/TX/PA/SC).
+
+    Must be called AFTER normalize() — which produces state_abbr — and BEFORE
+    to_canonical() and upsert_staging() so that out-of-state facilities never
+    reach geocoding or the database (D10).
+
+    Returns a copy; the input DataFrame is not mutated.
+    """
+    before = len(df)
+    filtered = df[df["state_abbr"].isin(_TARGET_STATES)].copy()
+    after = len(filtered)
+    print(
+        f"  va_facilities: state filter ({'/'.join(sorted(_TARGET_STATES))}): "
+        f"{before:,} -> {after:,} rows",
+        file=sys.stderr,
+    )
+    return filtered
 
 
 # ---------------------------------------------------------------- quality
@@ -246,6 +306,8 @@ def to_canonical(df: pd.DataFrame) -> pd.DataFrame:
         "longitude": df["longitude"],
         "facility_type": df["facilityType"],
         "operating_status": df["operating_status_code"],
+        "phone_raw": df["phone_raw"],
+        "phone_normalized": df["phone_normalized"],
     })
 
 
@@ -260,21 +322,103 @@ def main() -> None:
                     help="Output CSV path (default: va_health.csv)")
     ap.add_argument("--per-page", type=int, default=100,
                     help="Records per API page (default: 100, max: 100)")
+    ap.add_argument(
+        "--write-db",
+        action="store_true",
+        help="Also write results to Postgres staging (requires DATABASE_URL). "
+             "Off by default — the CSV is always written regardless.",
+    )
     args = ap.parse_args()
 
     api_key = get_secret("VA_API_KEY", required=True)
     session = make_session()
 
-    raw = load_raw(session, api_key, per_page=args.per_page)
+    raw, raw_bytes = load_raw(session, api_key, per_page=args.per_page)
     assert_source_shape(raw)
 
+    # B4 fix: hash the actual fetched JSON bytes (sort_keys=True serialisation
+    # of the raw API response objects), not a pandas re-serialisation.
+    sha256_hex = raw_sha256(raw_bytes)
+    byte_count = len(raw_bytes)
+    print(
+        f"  va_facilities: sha256={sha256_hex[:16]}…  bytes={byte_count:,}",
+        file=sys.stderr,
+    )
+
     df = normalize(raw)
+    # D10: filter to the 5 target states before building canonical output or
+    # writing to the database — out-of-state rows must not reach upsert_staging().
+    df = filter_to_target_states(df)
     report_quality(df)
 
     canonical = to_canonical(df)
     canonical.to_csv(args.out, index=False)
 
     print(f"\n  wrote {len(canonical):,} records -> {args.out}", file=sys.stderr)
+
+    # Write to Postgres only when explicitly requested via --write-db.
+    if args.write_db:
+        if not get_secret("DATABASE_URL"):
+            sys.exit(
+                "ERROR: --write-db was given but DATABASE_URL is not set. "
+                "Copy .env.example -> .env and fill it in."
+            )
+
+        # D7: upload raw payload to GCS before writing source_run.
+        # Returns None when GCS is disabled/unavailable — never raises.
+        run_date = datetime.date.today().isoformat()
+        raw_uri = upload_raw(SOURCE_ID, run_date, raw_bytes)
+
+        engine = get_engine()
+        source_run_id: int | None = None
+        try:
+            source_run_id = write_source_run(
+                engine,
+                source_id=SOURCE_ID,
+                byte_count=byte_count,
+                sha256=sha256_hex,
+                connector_version="1.0",
+                license_string="VA Facilities — public domain, U.S. Department of Veterans Affairs",
+                raw_uri=raw_uri,
+            )
+
+            full_canonical = build_canonical(
+                canonical.index,
+                source_id=SOURCE_ID,
+                natural_key=canonical["natural_key"],
+                vertical=VERTICAL,
+                account_type=canonical["facility_type"],
+                name_raw=canonical["name_raw"],
+                name_normalized=canonical["name_raw"].map(normalize_name),
+                address_line_1=canonical["address_line_1"],
+                city=canonical["city"],
+                state=canonical["site_state"],
+                zip5=canonical["zip5"],
+                latitude=canonical["latitude"],
+                longitude=canonical["longitude"],
+                phone_raw=canonical["phone_raw"],
+                phone_normalized=canonical["phone_normalized"],
+                source_file=SOURCE_URL,
+            )
+
+            upsert_staging(engine, SOURCE_ID, full_canonical)
+
+            finish_source_run(
+                engine,
+                source_run_id,
+                status="succeeded",
+                row_count=len(full_canonical),
+            )
+            print(
+                f"  va_facilities: wrote {len(full_canonical):,} rows "
+                f"to staging.{SOURCE_ID} (source_run_id={source_run_id})",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            if source_run_id is not None:
+                finish_source_run(engine, source_run_id, status="failed")
+            print(f"  va_facilities: DB write failed — {exc}", file=sys.stderr)
+            raise
 
 
 if __name__ == "__main__":
