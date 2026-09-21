@@ -241,6 +241,47 @@ class TestUploadRawHappyPath:
         assert result.endswith(".json")
         assert not result.endswith(".json.gz")
 
+    def test_suffix_pdf_uses_pdf_gz_extension(self, monkeypatch):
+        """PDF payloads keep a .pdf.gz name so the object isn't labeled JSON."""
+        monkeypatch.delenv("DISABLE_GCS", raising=False)
+        monkeypatch.setenv("GCS_RAW_BUCKET", "juniper-ingest-raw")
+
+        payload = b"%PDF-1.4 scanned certificate"
+        expected_sha = raw_sha256(payload)
+        mock_storage, _, mock_bucket, mock_blob = _make_gcs_module_mock()
+
+        with patch.dict("sys.modules", _gcs_sys_modules_patch(mock_storage)):
+            result = upload_raw(
+                "tx_trec_pdf_enrich", "2026-09-21", payload, gzip=True, suffix="pdf",
+            )
+
+        expected_object = f"tx_trec_pdf_enrich/2026-09-21/{expected_sha}.pdf.gz"
+        mock_bucket.blob.assert_called_once_with(expected_object)
+        assert result == f"gs://juniper-ingest-raw/{expected_object}"
+        mock_blob.upload_from_string.assert_called_once()
+        assert mock_blob.upload_from_string.call_args.kwargs["content_type"] == "application/gzip"
+
+    def test_suffix_pdf_gzip_false_is_application_pdf(self, monkeypatch):
+        monkeypatch.delenv("DISABLE_GCS", raising=False)
+        monkeypatch.setenv("GCS_RAW_BUCKET", "juniper-ingest-raw")
+
+        mock_storage, _, mock_bucket, mock_blob = _make_gcs_module_mock()
+        with patch.dict("sys.modules", _gcs_sys_modules_patch(mock_storage)):
+            result = upload_raw(
+                "tx_trec_pdf_enrich", "2026-09-21", b"%PDF", gzip=False, suffix="pdf",
+            )
+
+        assert result is not None
+        assert result.endswith(".pdf")
+        assert not result.endswith(".pdf.gz")
+        assert mock_blob.upload_from_string.call_args.kwargs["content_type"] == "application/pdf"
+        mock_bucket.blob.assert_called_once()
+
+    def test_suffix_rejects_path_separators(self, monkeypatch):
+        monkeypatch.delenv("DISABLE_GCS", raising=False)
+        with pytest.raises(ValueError):
+            upload_raw("cms_general", "2026-08-20", b"data", suffix="../json")
+
     def test_gzip_true_uses_json_gz_extension(self, monkeypatch):
         monkeypatch.delenv("DISABLE_GCS", raising=False)
         monkeypatch.setenv("GCS_RAW_BUCKET", "juniper-ingest-raw")

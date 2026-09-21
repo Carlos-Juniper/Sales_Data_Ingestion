@@ -2,8 +2,9 @@
 # HOA vertical pipeline — D9 sequential execution.
 #
 # Stage order:
-#   1. TX TREC HOA  (Texas open data CSV, no key)
-#   2. core_apply   -> core.*
+#   1. TX TREC HOA          (Texas open data CSV, no key)
+#   2. TX TREC PDF OCR      (certificate queue from stage 1 → enrich_hoa_pdf_contact)
+#   3. core_apply           -> core.*
 #
 # Required env vars:
 #   DATABASE_URL      — libpq connection string; composed below from DB_PASSWORD_SECRET
@@ -15,6 +16,11 @@
 # Optional env vars:
 #   HOA_ZCTA_CROSSWALK — path to the Census ZCTA-to-county relationship file;
 #                        used to backfill county from ZIP when available
+#   HOA_PDF_WORKERS    — OCR thread count (default 1). Downloads stay at
+#                        HOA_PDF_SLEEP seconds apart regardless of this value.
+#   HOA_PDF_SLEEP      — seconds between certificate downloads (default 1.0)
+#   HOA_PDF_LIMIT      — process only the first N queue rows (metro slice / smoke)
+#   HOA_PDF_COUNTY     — process only this county_primary (e.g. HARRIS)
 
 set -euo pipefail
 
@@ -43,7 +49,7 @@ echo "[hoa] working directory: ${WORK_DIR}" >&2
 #    tx_trec_hoa takes positional file paths (glob-expanded by the script, not
 #    the shell, because the connector calls glob.glob() on each pattern).
 # ---------------------------------------------------------------------------
-echo "[hoa] stage 1/2 — TX TREC HOA" >&2
+echo "[hoa] stage 1/3 — TX TREC HOA" >&2
 : "${HOA_DATA_GLOB:?HOA_DATA_GLOB must be set to glob matching TREC_HOA_Management_Certificates_*.csv}"
 
 ZCTA_ARGS=""
@@ -60,9 +66,32 @@ python -m hoa.tx_trec_hoa \
     ${ZCTA_ARGS}
 
 # ---------------------------------------------------------------------------
-# 2. core_apply -> core.*
+# 2. TX TREC certificate PDF OCR
+#    Queue CSV from stage 1. Scanned certificates — OCR is the primary path.
+#    Cached ok rows (same certificate_id) are skipped inside the connector.
 # ---------------------------------------------------------------------------
-echo "[hoa] stage 2/2 — core_apply" >&2
+echo "[hoa] stage 2/3 — TX TREC PDF OCR enrich" >&2
+
+PDF_ARGS=(
+    --queue "${WORK_DIR}/tx_trec_pdf_queue.csv"
+    --out "${WORK_DIR}/tx_trec_pdf_enriched.csv"
+    --workers "${HOA_PDF_WORKERS:-1}"
+    --sleep "${HOA_PDF_SLEEP:-1.0}"
+    --write-db
+)
+if [[ -n "${HOA_PDF_LIMIT:-}" ]]; then
+    PDF_ARGS+=(--limit "${HOA_PDF_LIMIT}")
+fi
+if [[ -n "${HOA_PDF_COUNTY:-}" ]]; then
+    PDF_ARGS+=(--county "${HOA_PDF_COUNTY}")
+fi
+
+python -m hoa.tx_trec_pdf_enrich "${PDF_ARGS[@]}"
+
+# ---------------------------------------------------------------------------
+# 3. core_apply -> core.*
+# ---------------------------------------------------------------------------
+echo "[hoa] stage 3/3 — core_apply" >&2
 python -m lib.core_apply --run-id 0
 
 echo "[hoa] pipeline complete" >&2

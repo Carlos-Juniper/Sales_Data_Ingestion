@@ -52,7 +52,8 @@ instead of one site at a time.
 - Merge: `healthcare_merge.py` — CCN → NPI → (name_normalized, zip5, site_state) → fuzzy tier-3 scoring.
 
 ### HOA (`connectors/hoa/`)
-- **TX TREC Management Certificates** — `data.texas.gov`, statewide bulk CSV, ~17k associations. Mandatory filing under Tex. Prop. Code §209.004. Gives a clean 1:1 registry (name, type, city, ZIP) but **no street address, phone, or management company** — that lives in a linked county-recorded PDF, out of scope for now. (`tx_trec_hoa.py`)
+- **TX TREC Management Certificates** — `data.texas.gov`, statewide bulk CSV, ~17k associations. Mandatory filing under Tex. Prop. Code §209.004. Gives a clean 1:1 registry (name, type, city, ZIP) but **no street address, phone, or management company**. (`tx_trec_hoa.py`)
+- **TX TREC certificate PDF OCR** — separate slow pass over `build_pdf_queue()` output. Certificates are scanned images, so the connector OCRs them and anchors on the numbered field-5/6/7 labels. Contact fields land in `staging.enrich_hoa_pdf_contact` (not `core.*`); low-confidence parses set `needs_review`. (`tx_trec_pdf_enrich.py`)
 - FL/NC/SC/PA are explicitly deferred — no state HOA registry exists comparable to TX's; FL's path runs through Sunbiz bulk corporate data + statewide parcels, not yet built.
 
 ### Deathcare (`connectors/deathcare/`)

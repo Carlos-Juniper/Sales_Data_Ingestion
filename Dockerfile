@@ -17,10 +17,16 @@ ENV PYTHONPATH=/app/connectors
 
 WORKDIR /app
 
-# Install system deps needed by psycopg binary wheel and gzip utils.
+# Install system deps needed by psycopg and by the HOA certificate OCR pass.
 # libpq5 is the Postgres client lib pulled by psycopg[binary].
+# tesseract-ocr + poppler-utils: tx_trec_pdf_enrich renders scanned
+# management-certificate PDFs (pdf2image/pdftoppm) and OCRs them. The
+# dominant TREC filing is a CCITT image with no text layer.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libpq5 \
+    && apt-get install -y --no-install-recommends \
+        libpq5 \
+        tesseract-ocr \
+        poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps first (layer cached unless requirements.txt changes).
