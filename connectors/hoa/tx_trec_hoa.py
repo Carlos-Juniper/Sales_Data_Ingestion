@@ -37,13 +37,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import re
 import sys
 
 import pandas as pd
 
+from lib.db import finish_source_run, get_engine, upsert_staging, write_source_run
+from lib.gcs import raw_sha256, upload_raw
+from lib.http import get_secret
 from lib.normalize import normalize_name, normalize_zip
+from lib.schema import build_canonical
 
 SOURCE_ID = "tx_trec_hoa"
 VERTICAL = "hoa"
@@ -72,14 +77,26 @@ TYPE_MAP = {
 
 # ---------------------------------------------------------------- extract
 
-def load_raw(paths: list[str]) -> pd.DataFrame:
+def load_raw(paths: list[str]) -> tuple[pd.DataFrame, bytes]:
+    """Read one or more source CSVs and return a DataFrame plus the raw bytes.
+
+    The raw bytes are the verbatim file contents concatenated in path order.
+    They are the canonical payload for SHA-256 hashing (D7/B4) — not a pandas
+    re-serialisation, which would vary with pandas version and column order.
+
+    Returns:
+        (DataFrame of all rows, concatenated raw CSV bytes)
+    """
     frames = []
+    raw_parts: list[bytes] = []
     for p in paths:
+        with open(p, "rb") as fh:
+            raw_parts.append(fh.read())
         df = pd.read_csv(p, dtype=str, keep_default_na=False)
         df["_source_file"] = p.rsplit("/", 1)[-1]
         frames.append(df)
         print(f"  read {p}: {len(df):,} rows", file=sys.stderr)
-    return pd.concat(frames, ignore_index=True)
+    return pd.concat(frames, ignore_index=True), b"".join(raw_parts)
 
 
 # ---------------------------------------------------------------- transform
@@ -245,6 +262,10 @@ def assert_source_shape(df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------- entrypoint
 
 def main() -> None:
+    # All flags registered before parse_args() so --help always shows the
+    # complete list (avoids the two-pass-parse bug in cms_provider_data.py
+    # where --dataset and --write-db registered after parse_known_args were
+    # absent from the help output).
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -254,17 +275,24 @@ def main() -> None:
     ap.add_argument("--queue", default="tx_trec_pdf_queue.csv")
     ap.add_argument("--zcta-crosswalk", default=None,
                     help="Census ZCTA-to-county relationship file, to backfill county from ZIP")
+    ap.add_argument(
+        "--write-db",
+        action="store_true",
+        help="Also write results to Postgres staging (requires DATABASE_URL). "
+             "Off by default — the CSV is always written regardless.",
+    )
     args = ap.parse_args()
 
     paths = sorted({p for pat in args.paths for p in glob.glob(pat)}) or args.paths
-    raw = load_raw(paths)
+    raw, raw_bytes = load_raw(paths)
     assert_source_shape(raw)
 
     df = normalize(raw)
     report_quality(df)
     df = backfill_county_from_zip(df, args.zcta_crosswalk)
 
-    to_canonical(df).to_csv(args.out, index=False)
+    canonical = to_canonical(df)
+    canonical.to_csv(args.out, index=False)
     queue = build_pdf_queue(df)
     queue.to_csv(args.queue, index=False)
 
@@ -275,6 +303,71 @@ def main() -> None:
         print(f"    {c:<14} {n:>6,}", file=sys.stderr)
     print("\n  NOTE: no contact data until the PDF pass runs. "
           "contact_status='pending_pdf' on every row.", file=sys.stderr)
+
+    # Write to Postgres only when explicitly requested via --write-db.
+    if args.write_db:
+        if not get_secret("DATABASE_URL"):
+            sys.exit(
+                "ERROR: --write-db was given but DATABASE_URL is not set. "
+                "Copy .env.example -> .env and fill it in."
+            )
+
+        # D7: hash the real fetched bytes (verbatim CSV reads), not a
+        # pandas re-serialisation.
+        sha256_hex = raw_sha256(raw_bytes)
+        byte_count = len(raw_bytes)
+        run_date = datetime.date.today().isoformat()
+        raw_uri = upload_raw(SOURCE_ID, run_date, raw_bytes)
+
+        engine = get_engine()
+        source_run_id: int | None = None
+        try:
+            source_run_id = write_source_run(
+                engine,
+                source_id=SOURCE_ID,
+                byte_count=byte_count,
+                sha256=sha256_hex,
+                connector_version="1.0",
+                license_string="Texas public records — free to store and use commercially",
+                raw_uri=raw_uri,
+            )
+
+            # Build the full CANONICAL_COLUMNS DataFrame.  The HOA canonical
+            # has location data in site_* columns; map to the standard names.
+            full_canonical = build_canonical(
+                canonical.index,
+                source_id=SOURCE_ID,
+                natural_key=canonical["natural_key"],
+                vertical=VERTICAL,
+                account_type=canonical["account_type"],
+                name_raw=canonical["legal_name"],
+                name_normalized=canonical["name_normalized"],
+                city=canonical["site_city"],
+                state=canonical["site_state"],
+                zip5=canonical["site_zip"],
+                county_fips=canonical["county_primary"],
+                size_metric=canonical["association_type"],
+                source_file="tx_trec_hoa_csv",
+            )
+
+            upsert_staging(engine, SOURCE_ID, full_canonical)
+
+            finish_source_run(
+                engine,
+                source_run_id,
+                status="succeeded",
+                row_count=len(full_canonical),
+            )
+            print(
+                f"  tx_trec_hoa: wrote {len(full_canonical):,} rows "
+                f"to staging.{SOURCE_ID} (source_run_id={source_run_id})",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            if source_run_id is not None:
+                finish_source_run(engine, source_run_id, status="failed")
+            print(f"  tx_trec_hoa: DB write failed — {exc}", file=sys.stderr)
+            raise
 
 
 if __name__ == "__main__":
