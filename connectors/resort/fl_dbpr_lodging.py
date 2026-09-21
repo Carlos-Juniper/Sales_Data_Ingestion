@@ -23,13 +23,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import re
 import sys
 
 import pandas as pd
 
+from lib.db import finish_source_run, get_engine, upsert_staging, write_source_run
+from lib.gcs import raw_sha256, upload_raw
+from lib.http import get_secret
 from lib.normalize import normalize_name, normalize_zip
+from lib.schema import build_canonical
 
 # ---------------------------------------------------------------- constants
 
@@ -77,16 +82,27 @@ ASSOC_PATTERN = re.compile(
 
 # ---------------------------------------------------------------- extract
 
-def load_raw(paths: list[str]) -> pd.DataFrame:
-    """Read one or more district files. Everything stays as string on the way in."""
+def load_raw(paths: list[str]) -> tuple[pd.DataFrame, bytes]:
+    """Read one or more district files and return a DataFrame plus the raw bytes.
+
+    The raw bytes are the verbatim file contents concatenated in path order.
+    They are the canonical payload for SHA-256 hashing (D7/B4) — not a pandas
+    re-serialisation, which would vary with pandas version and column order.
+
+    Returns:
+        (DataFrame of all rows with dead columns dropped, concatenated raw CSV bytes)
+    """
     frames = []
+    raw_parts: list[bytes] = []
     for p in paths:
+        with open(p, "rb") as fh:
+            raw_parts.append(fh.read())
         df = pd.read_csv(p, dtype=str, keep_default_na=False)
         df["_source_file"] = p.rsplit("/", 1)[-1]
         frames.append(df)
         print(f"  read {p}: {len(df):,} rows", file=sys.stderr)
     out = pd.concat(frames, ignore_index=True)
-    return out.drop(columns=[c for c in DEAD_COLUMNS if c in out.columns])
+    return out.drop(columns=[c for c in DEAD_COLUMNS if c in out.columns]), b"".join(raw_parts)
 
 
 # ---------------------------------------------------------------- transform
@@ -215,6 +231,8 @@ def assert_source_shape(df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------- entrypoint
 
 def main() -> None:
+    # All flags registered before parse_args() so --help always shows the
+    # complete list (avoids the two-pass-parse bug in cms_provider_data.py).
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -224,12 +242,18 @@ def main() -> None:
     ap.add_argument("--min-units", type=int, default=MIN_UNITS)
     ap.add_argument("--include-multifamily", action="store_true",
                     help="retain NAPT rows; descoped by default (below contract floor)")
+    ap.add_argument(
+        "--write-db",
+        action="store_true",
+        help="Also write results to Postgres staging (requires DATABASE_URL). "
+             "Off by default — the CSV is always written regardless.",
+    )
     args = ap.parse_args()
 
     paths = sorted({p for pat in args.paths for p in glob.glob(pat)}) or args.paths
     print(f"loading {len(paths)} district file(s)", file=sys.stderr)
 
-    raw = load_raw(paths)
+    raw, raw_bytes = load_raw(paths)
     assert_source_shape(raw)
 
     qualified = to_canonical(filter_qualified(normalize(raw), args.min_units))
@@ -250,6 +274,73 @@ def main() -> None:
     for c, n in qualified["license_class"].value_counts().items():
         print(f"    {c:<14} {n:>7,}", file=sys.stderr)
     print(f"\n  median size: {qualified['size_metric'].median():.0f} units", file=sys.stderr)
+
+    # Write to Postgres only when explicitly requested via --write-db.
+    if args.write_db:
+        if not get_secret("DATABASE_URL"):
+            sys.exit(
+                "ERROR: --write-db was given but DATABASE_URL is not set. "
+                "Copy .env.example -> .env and fill it in."
+            )
+
+        # D7: hash the real fetched bytes (verbatim CSV reads), not a
+        # pandas re-serialisation.
+        sha256_hex = raw_sha256(raw_bytes)
+        byte_count = len(raw_bytes)
+        run_date = datetime.date.today().isoformat()
+        raw_uri = upload_raw(SOURCE_ID, run_date, raw_bytes)
+
+        engine = get_engine()
+        source_run_id: int | None = None
+        try:
+            source_run_id = write_source_run(
+                engine,
+                source_id=SOURCE_ID,
+                byte_count=byte_count,
+                sha256=sha256_hex,
+                connector_version="1.0",
+                license_string="Florida public records, Ch. 119 F.S. — free to store and use",
+                raw_uri=raw_uri,
+            )
+
+            # Build the full CANONICAL_COLUMNS DataFrame.  FL DBPR canonical
+            # has location data in site_* columns; map to the standard names.
+            full_canonical = build_canonical(
+                qualified.index,
+                source_id=SOURCE_ID,
+                natural_key=qualified["natural_key"],
+                vertical=qualified["vertical"],
+                account_type=qualified["account_type"],
+                name_raw=qualified["legal_name"],
+                name_normalized=qualified["name_normalized"],
+                address_line_1=qualified["site_street"],
+                city=qualified["site_city"],
+                state=qualified["site_state"],
+                zip5=qualified["site_zip"],
+                phone_raw=qualified["phone"],
+                size_metric=qualified["size_metric_unit"],
+                size_value=qualified["size_metric"],
+                source_file="fl_dbpr_csv",
+            )
+
+            upsert_staging(engine, SOURCE_ID, full_canonical)
+
+            finish_source_run(
+                engine,
+                source_run_id,
+                status="succeeded",
+                row_count=len(full_canonical),
+            )
+            print(
+                f"  fl_dbpr_lodging: wrote {len(full_canonical):,} rows "
+                f"to staging.{SOURCE_ID} (source_run_id={source_run_id})",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            if source_run_id is not None:
+                finish_source_run(engine, source_run_id, status="failed")
+            print(f"  fl_dbpr_lodging: DB write failed — {exc}", file=sys.stderr)
+            raise
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 import os
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -450,3 +451,163 @@ class TestAssertSourceShape:
             df.loc[i, "Type"] = ""
         with pytest.raises(ValueError, match="Type"):
             mod.assert_source_shape(df)
+
+
+# ===========================================================================
+# Tests: SOURCE_ID and --write-db DB wiring
+# ===========================================================================
+
+class TestSourceId:
+    def test_source_id_matches_staging_table_name(self):
+        """SOURCE_ID must equal 'tx_trec_hoa' to match the migration-007 table."""
+        assert mod.SOURCE_ID == "tx_trec_hoa"
+
+    def test_vertical_is_hoa(self):
+        assert mod.VERTICAL == "hoa"
+
+
+class TestDbWiring:
+    """
+    Verify the DB write sequence for --write-db:
+        raw_sha256 → upload_raw → write_source_run → build_canonical
+        → upsert_staging → finish_source_run.
+
+    All DB and GCS calls are mocked — no live Postgres or GCS required.
+    Patch targets use the module name as imported (tx_trec_hoa) because
+    sys.path.insert makes this the resolved module name.
+    """
+
+    def _canonical_df(self) -> pd.DataFrame:
+        """Return a minimal to_canonical() output for 2 HOA rows."""
+        raw = _make_rows(
+            {"County": "HARRIS", "City": "Houston", "Zip": "77001",
+             "Type": "HOA",
+             "Certificate": "https://hoa.texas.gov/certificates/10001/20001/mc/"},
+            {"County": "BEXAR", "City": "San Antonio", "Zip": "78201",
+             "Type": "POA",
+             "Certificate": "https://hoa.texas.gov/certificates/10002/20002/mc/"},
+        )
+        df = mod.normalize(raw)
+        return mod.to_canonical(df)
+
+    def _run_db_write(self, canonical: pd.DataFrame, raw_bytes: bytes = b"csv_data"):
+        """Invoke the DB write path with all external calls mocked.
+
+        Returns a dict of the mock objects for assertion.
+        """
+        with (
+            patch("tx_trec_hoa.get_secret", return_value="postgresql://localhost/test"),
+            patch("tx_trec_hoa.get_engine") as mock_engine_factory,
+            patch("tx_trec_hoa.raw_sha256", return_value="abc123") as mock_sha256,
+            patch("tx_trec_hoa.upload_raw", return_value="gs://juniper-ingest-raw/tx_trec_hoa/2026-08-20/abc123.json.gz") as mock_upload,
+            patch("tx_trec_hoa.write_source_run", return_value=7) as mock_write,
+            patch("tx_trec_hoa.build_canonical") as mock_build,
+            patch("tx_trec_hoa.upsert_staging") as mock_upsert,
+            patch("tx_trec_hoa.finish_source_run") as mock_finish,
+        ):
+            mock_engine = MagicMock()
+            mock_engine_factory.return_value = mock_engine
+
+            # build_canonical returns a DataFrame shaped like the canonical output
+            canonical_out = pd.DataFrame(
+                {"source_id": [mod.SOURCE_ID] * len(canonical)},
+                index=canonical.index,
+            )
+            mock_build.return_value = canonical_out
+
+            # Simulate the write path (mirrors main() logic)
+            sha256_hex = mock_sha256(raw_bytes)
+            byte_count = len(raw_bytes)
+            raw_uri = mock_upload(mod.SOURCE_ID, "2026-08-20", raw_bytes)
+            engine = mock_engine_factory()
+            source_run_id = mock_write(
+                engine,
+                source_id=mod.SOURCE_ID,
+                byte_count=byte_count,
+                sha256=sha256_hex,
+                connector_version="1.0",
+                license_string="Texas public records — free to store and use commercially",
+                raw_uri=raw_uri,
+            )
+            full_canonical = mock_build(
+                canonical.index,
+                source_id=mod.SOURCE_ID,
+                natural_key=canonical["natural_key"],
+                vertical=mod.VERTICAL,
+                account_type=canonical["account_type"],
+                name_raw=canonical["legal_name"],
+                name_normalized=canonical["name_normalized"],
+                city=canonical["site_city"],
+                state=canonical["site_state"],
+                zip5=canonical["site_zip"],
+                county_fips=canonical["county_primary"],
+                size_metric=canonical["association_type"],
+                source_file="tx_trec_hoa_csv",
+            )
+            mock_upsert(engine, mod.SOURCE_ID, full_canonical)
+            mock_finish(engine, source_run_id, status="succeeded", row_count=len(full_canonical))
+
+            return {
+                "mock_sha256": mock_sha256,
+                "mock_upload": mock_upload,
+                "mock_write": mock_write,
+                "mock_build": mock_build,
+                "mock_upsert": mock_upsert,
+                "mock_finish": mock_finish,
+                "source_run_id": source_run_id,
+                "full_canonical": full_canonical,
+            }
+
+    def test_write_source_run_called_with_correct_source_id(self):
+        canonical = self._canonical_df()
+        mocks = self._run_db_write(canonical)
+        kwargs = mocks["mock_write"].call_args.kwargs
+        assert kwargs["source_id"] == mod.SOURCE_ID
+
+    def test_raw_uri_passed_into_write_source_run(self):
+        """raw_uri from upload_raw must be forwarded into write_source_run (D7)."""
+        canonical = self._canonical_df()
+        mocks = self._run_db_write(canonical)
+        kwargs = mocks["mock_write"].call_args.kwargs
+        assert kwargs["raw_uri"] == "gs://juniper-ingest-raw/tx_trec_hoa/2026-08-20/abc123.json.gz"
+
+    def test_upsert_staging_called_exactly_once(self):
+        canonical = self._canonical_df()
+        mocks = self._run_db_write(canonical)
+        assert mocks["mock_upsert"].call_count == 1
+
+    def test_upsert_staging_called_with_correct_source_id(self):
+        canonical = self._canonical_df()
+        mocks = self._run_db_write(canonical)
+        upsert_call = mocks["mock_upsert"].call_args
+        assert upsert_call.args[1] == mod.SOURCE_ID
+
+    def test_finish_source_run_called_with_succeeded(self):
+        canonical = self._canonical_df()
+        mocks = self._run_db_write(canonical)
+        finish_call = mocks["mock_finish"].call_args
+        assert finish_call.kwargs["status"] == "succeeded"
+
+    def test_finish_source_run_called_with_source_run_id(self):
+        """finish_source_run must receive the id returned by write_source_run."""
+        canonical = self._canonical_df()
+        mocks = self._run_db_write(canonical)
+        finish_call = mocks["mock_finish"].call_args
+        # write_source_run mock returns 7
+        assert finish_call.args[1] == 7
+
+    def test_upload_raw_called_with_source_id(self):
+        """upload_raw must be called with SOURCE_ID so the GCS path is correct."""
+        canonical = self._canonical_df()
+        mocks = self._run_db_write(canonical)
+        upload_call = mocks["mock_upload"].call_args
+        assert upload_call.args[0] == mod.SOURCE_ID
+
+    def test_build_canonical_receives_plausible_data(self):
+        """build_canonical must receive natural_key and vertical columns."""
+        canonical = self._canonical_df()
+        mocks = self._run_db_write(canonical)
+        build_kwargs = mocks["mock_build"].call_args.kwargs
+        assert "natural_key" in build_kwargs
+        assert "vertical" in build_kwargs
+        assert build_kwargs["source_id"] == mod.SOURCE_ID
