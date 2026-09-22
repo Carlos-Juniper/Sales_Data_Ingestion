@@ -1,6 +1,9 @@
 google-cloud-storage>=2.10  # D7 raw landing; lazy-imported so absence is graceful
 pandas>=2.0,<3  # pandas 3.0 removed .str-on-all-NA-float behavior the connectors rely on
+pdf2image>=1.17.0  # render scanned TREC certificate PDFs; needs poppler-utils
+pdfplumber>=0.10  # text-layer extraction for TREC certificates; falls back to OCR when sparse
 psycopg[binary]>=3.1
+pytesseract>=0.3.13  # OCR for TREC certificates; needs the tesseract binary
 python-dotenv>=1.0
 pyyaml>=6.0
 rapidfuzz>=3.0

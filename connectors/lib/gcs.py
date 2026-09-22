@@ -13,7 +13,7 @@ the SA ingestion-connector@... holds bucket-scoped storage.objectAdmin.
 Bucket is controlled by the GCS_RAW_BUCKET env var (default juniper-ingest-raw).
 
 Contract (other agents depend on these exact signatures):
-    upload_raw(source_id, run_date, raw_bytes, *, gzip=True) -> str | None
+    upload_raw(source_id, run_date, raw_bytes, *, gzip=True, suffix="json") -> str | None
     raw_sha256(raw_bytes) -> str
 """
 
@@ -53,12 +53,17 @@ def upload_raw(
     raw_bytes: bytes,
     *,
     gzip: bool = True,
+    suffix: str = "json",
 ) -> Optional[str]:
     """Upload *raw_bytes* to the GCS raw-landing bucket and return the gs:// URI.
 
     Object path is content-addressed:
-        gs://<bucket>/<source_id>/<run_date>/<sha256>.json.gz   (gzip=True)
-        gs://<bucket>/<source_id>/<run_date>/<sha256>.json      (gzip=False)
+        gs://<bucket>/<source_id>/<run_date>/<sha256>.<suffix>.gz  (gzip=True)
+        gs://<bucket>/<source_id>/<run_date>/<sha256>.<suffix>     (gzip=False)
+
+    The default suffix is ``json``, so existing callers keep the historical
+    ``.json.gz`` / ``.json`` names. Pass ``suffix="pdf"`` for a real PDF
+    payload (TX TREC management certificates).
 
     Because the object name is derived from the SHA-256 of *raw_bytes*, a
     re-run with unchanged bytes writes to the exact same object path —
@@ -74,13 +79,20 @@ def upload_raw(
         raw_bytes: The raw payload to store — real fetched/read bytes, not a
                    pandas re-serialisation.
         gzip:      When True (default), compress with gzip before uploading.
-                   The object name always ends in ``.json.gz`` in that case.
+                   The object name ends in ``.<suffix>.gz`` in that case.
+        suffix:    File suffix without a leading dot. Default ``"json"``.
+                   Must be alphanumeric (no path separators).
 
     Returns:
         The full ``gs://`` URI on success, or ``None`` when GCS is
         unavailable / disabled (so the connector path never raises for an
-        infra reason).
+        infra reason). A bad ``suffix`` still raises: that is a caller bug,
+        not an infrastructure miss.
     """
+    # Validate before the DISABLE_GCS short-circuit so a path-injection
+    # suffix fails the same way in local dev as it does in Cloud Run.
+    suffix = _validate_suffix(suffix)
+
     # Honour explicit local-dev bypass first — cheapest check.
     if os.environ.get("DISABLE_GCS", "").strip() in ("1", "true", "yes"):
         logger.debug("upload_raw: GCS disabled via DISABLE_GCS — skipping upload")
@@ -102,11 +114,11 @@ def upload_raw(
     # SHA-256 is always over the *uncompressed* raw_bytes so the digest is
     # stable and independent of the gzip implementation.
     sha = raw_sha256(raw_bytes)
-    extension = "json.gz" if gzip else "json"
+    extension = f"{suffix}.gz" if gzip else suffix
     object_name = f"{source_id}/{run_date}/{sha}.{extension}"
 
     payload = _compress_gzip(raw_bytes) if gzip else raw_bytes
-    content_type = "application/gzip" if gzip else "application/json"
+    content_type = _content_type(suffix, gzip=gzip)
 
     try:
         client = gcs_storage.Client()
@@ -134,6 +146,31 @@ def upload_raw(
 
 
 # ------------------------------------------------------------------ internals
+
+
+def _validate_suffix(suffix: str) -> str:
+    """Reject anything that could change the object-path prefix.
+
+    ``suffix`` is interpolated into the GCS object name. A value containing
+    a slash, dot, or empty string would let a caller escape the
+    ``{source_id}/{run_date}/`` partition.
+    """
+    cleaned = (suffix or "").strip().lstrip(".")
+    if not cleaned or not cleaned.isalnum():
+        raise ValueError(
+            f"upload_raw suffix must be alphanumeric, got {suffix!r}"
+        )
+    return cleaned
+
+
+def _content_type(suffix: str, *, gzip: bool) -> str:
+    if gzip:
+        return "application/gzip"
+    if suffix == "pdf":
+        return "application/pdf"
+    if suffix == "json":
+        return "application/json"
+    return "application/octet-stream"
 
 
 def _compress_gzip(data: bytes) -> bytes:
