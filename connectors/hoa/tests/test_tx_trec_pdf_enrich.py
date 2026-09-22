@@ -474,7 +474,7 @@ class TestEnrich:
                 df,
                 sleep_s=0,
                 land_raw=False,
-                skip_keys={("123456", "51-253")},
+                skip_keys={"123456": "51-253"},
             )
         process.assert_not_called()
         assert out["enrich_status"].iloc[0] == "skipped"
@@ -497,11 +497,75 @@ class TestEnrich:
                 df,
                 sleep_s=0,
                 land_raw=False,
-                skip_keys={("123456", "51-253")},
+                skip_keys={"123456": "51-253"},
             )
         process.assert_called_once()
         assert out["enrich_status"].iloc[0] == "ok"
         assert out["rep_email"].iloc[0] == "info@goodwin-co.com"
+
+    def test_new_certificate_id_triggers_refetch(self):
+        """A queue row whose certificate_id differs from the cached one is NOT skipped."""
+        import pandas as pd
+        from connectors.hoa.tx_trec_pdf_enrich import enrich, _output_frame
+
+        df = pd.DataFrame([{
+            "association_id": "AAA",
+            "certificate_id": "CERT-NEW",
+            "url": "https://example.com/cert.pdf",
+        }])
+
+        processed = []
+
+        def fake_process(row, **kw):
+            processed.append(row)
+            return {
+                "source_id": "tx_trec_hoa",
+                "natural_key": "AAA",
+                "certificate_id": "CERT-NEW",
+                "enrich_status": "ok",
+                "confidence": 1.0,
+                "needs_review": False,
+                "review_reasons": None,
+            }
+
+        import connectors.hoa.tx_trec_pdf_enrich as mod
+        original = mod.process_certificate
+        mod.process_certificate = fake_process
+        try:
+            # skip_keys has the OLD cert for this association
+            result = enrich(df, skip_keys={"AAA": "CERT-OLD"}, land_raw=False)
+        finally:
+            mod.process_certificate = original
+
+        assert processed, "Queue row with new certificate_id should NOT be skipped"
+
+    def test_same_certificate_id_is_skipped(self):
+        """A queue row whose certificate_id matches the cached one IS skipped."""
+        import pandas as pd
+        from connectors.hoa.tx_trec_pdf_enrich import enrich
+
+        df = pd.DataFrame([{
+            "association_id": "BBB",
+            "certificate_id": "CERT-SAME",
+            "url": "https://example.com/cert.pdf",
+        }])
+
+        processed = []
+
+        def fake_process(row, **kw):
+            processed.append(row)
+            return {"enrich_status": "ok"}
+
+        import connectors.hoa.tx_trec_pdf_enrich as mod
+        original = mod.process_certificate
+        mod.process_certificate = fake_process
+        try:
+            result = enrich(df, skip_keys={"BBB": "CERT-SAME"}, land_raw=False)
+        finally:
+            mod.process_certificate = original
+
+        assert not processed, "Queue row with matching certificate_id SHOULD be skipped"
+        assert (result["enrich_status"] == "skipped").all()
 
     def test_workers_keep_results_on_the_right_row(self):
         df = _queue_df(
@@ -565,6 +629,137 @@ class TestOcrPdf:
 
         text = mod.ocr_pdf(b"%PDF-1.4")
         assert text == "5. Association\n\n6. Representative"
+
+
+class TestPdfTextExtraction:
+    """_extract_text_pdfplumber: text layer wins when substantial, OCR used as fallback."""
+
+    def test_pdfplumber_text_returned_when_substantial(self, monkeypatch):
+        fake_text = "5. Name and mailing address of the Association: Goodwin HOA\n" * 5
+        assert len(fake_text) >= 80  # ensure it crosses _PDFPLUMBER_MIN_CHARS
+
+        class _FakePage:
+            def extract_text(self):
+                return fake_text
+
+        class _FakePdf:
+            pages = [_FakePage()]
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        import sys
+        fake_pdfplumber = type(sys)("pdfplumber")
+        fake_pdfplumber.open = lambda _buf: _FakePdf()
+        monkeypatch.setitem(sys.modules, "pdfplumber", fake_pdfplumber)
+
+        from connectors.lib.pdf_ocr import _extract_text_pdfplumber
+        result = _extract_text_pdfplumber(b"%PDF-fake")
+        assert fake_text.strip() in result
+
+    def test_pdfplumber_short_text_returns_empty(self, monkeypatch):
+        """Text shorter than _PDFPLUMBER_MIN_CHARS is treated as no text layer."""
+        class _FakePage:
+            def extract_text(self):
+                return "hi"
+
+        class _FakePdf:
+            pages = [_FakePage()]
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        import sys
+        fake_pdfplumber = type(sys)("pdfplumber")
+        fake_pdfplumber.open = lambda _buf: _FakePdf()
+        monkeypatch.setitem(sys.modules, "pdfplumber", fake_pdfplumber)
+
+        from connectors.lib.pdf_ocr import _extract_text_pdfplumber, _PDFPLUMBER_MIN_CHARS
+        result = _extract_text_pdfplumber(b"%PDF-fake")
+        # the raw text IS returned — it's the caller's job to check length
+        assert len(result) < _PDFPLUMBER_MIN_CHARS
+
+    def test_pdfplumber_import_error_returns_empty(self, monkeypatch):
+        import sys
+        monkeypatch.setitem(sys.modules, "pdfplumber", None)
+        from connectors.lib.pdf_ocr import _extract_text_pdfplumber
+        result = _extract_text_pdfplumber(b"%PDF-fake")
+        assert result == ""
+
+    def test_process_certificate_uses_pdfplumber_when_text_rich(self, monkeypatch):
+        """When pdfplumber returns >= _PDFPLUMBER_MIN_CHARS, ocr_pdf is not called."""
+        from connectors.hoa import tx_trec_pdf_enrich as mod
+
+        rich_text = (
+            "5. Name and mailing address of the Association: Test HOA, PO Box 1, Austin TX 78701\n"
+            "6. Name, mailing address, phone number & email for designated representative:\n"
+            "Goodwin & Company\nPO Box 203310, Austin, TX\n855.289.6007\nInfo@goodwin-co.com\n"
+        )
+        assert len(rich_text) >= 80
+
+        monkeypatch.setattr(mod, "_extract_text_pdfplumber", lambda _b: rich_text)
+        ocr_called = []
+        monkeypatch.setattr(mod, "ocr_pdf", lambda _b, dpi=300: ocr_called.append(1) or "")
+
+        import requests
+        session = requests.Session()
+
+        def fake_fetch(url, sess, limiter, **kw):
+            return {"pdf_bytes": b"%PDF-1.4", "status": "ok", "error_detail": None, "review_reasons": None}
+
+        monkeypatch.setattr(mod, "fetch_pdf", fake_fetch)
+        monkeypatch.setattr(mod, "upload_raw", lambda *a, **kw: "gs://fake/obj")
+        monkeypatch.setattr(mod, "raw_sha256", lambda b: "abc123")
+
+        from connectors.lib.pdf_ocr import RateLimiter
+        result = mod._process_certificate(
+            natural_key="12345",
+            certificate_id="CERT-1",
+            url="https://example.com/cert.pdf",
+            session=session,
+            rate_limiter=RateLimiter(0),
+            dpi=300,
+            land_raw=False,
+            run_date="2026-09-22",
+        )
+        assert not ocr_called, "ocr_pdf should not be called when pdfplumber returns rich text"
+        assert result["enrich_status"] == "ok"
+
+    def test_process_certificate_falls_back_to_ocr_when_text_sparse(self, monkeypatch):
+        """When pdfplumber returns sparse text, ocr_pdf is called."""
+        from connectors.hoa import tx_trec_pdf_enrich as mod
+
+        monkeypatch.setattr(mod, "_extract_text_pdfplumber", lambda _b: "too short")
+        ocr_called = []
+
+        good_ocr = (
+            "5. Name and mailing address of the Association: Test HOA\n"
+            "6. Name, mailing address, phone number & email for designated representative:\n"
+            "Goodwin & Company\nPO Box 203310, Austin, TX\n855.289.6007\nInfo@goodwin-co.com\n"
+        )
+        monkeypatch.setattr(mod, "ocr_pdf", lambda _b, dpi=300: (ocr_called.append(1) or good_ocr))
+
+        import requests
+        session = requests.Session()
+
+        def fake_fetch(url, sess, limiter, **kw):
+            return {"pdf_bytes": b"%PDF-1.4", "status": "ok", "error_detail": None, "review_reasons": None}
+
+        monkeypatch.setattr(mod, "fetch_pdf", fake_fetch)
+        monkeypatch.setattr(mod, "upload_raw", lambda *a, **kw: "gs://fake/obj")
+        monkeypatch.setattr(mod, "raw_sha256", lambda b: "abc123")
+
+        from connectors.lib.pdf_ocr import RateLimiter
+        result = mod._process_certificate(
+            natural_key="12345",
+            certificate_id="CERT-1",
+            url="https://example.com/cert.pdf",
+            session=session,
+            rate_limiter=RateLimiter(0),
+            dpi=300,
+            land_raw=False,
+            run_date="2026-09-22",
+        )
+        assert ocr_called, "ocr_pdf should be called when pdfplumber text is sparse"
+        assert result["enrich_status"] == "ok"
 
 
 # ===========================================================================
@@ -671,7 +866,7 @@ class TestUpsert:
         result.fetchall.return_value = [("123456", "51-253"), ("999", None)]
         conn.execute.return_value = result
         keys = mod.load_cached_keys(engine)
-        assert keys == {("123456", "51-253")}
+        assert keys == {"123456": "51-253"}
         sql = str(conn.execute.call_args.args[0])
         assert "enrich_status = 'ok'" in sql
         assert "enrich_hoa_pdf_contact" in sql
