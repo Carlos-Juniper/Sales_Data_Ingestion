@@ -13,6 +13,7 @@ import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from urllib.parse import unquote, urlsplit
 
 import pandas as pd
 import pytest
@@ -260,6 +261,45 @@ Trinity Estates POA, Inc., PO Box 203310, Austin, TX 78720
 # ===========================================================================
 
 
+_HASH_PDF_URL = (
+    "https://hoa.texas.gov/certificates/12345/67890/mc/"
+    "#7 Hyde Park -- Management Certificate.pdf"
+)
+_HASH_PDF_URL_ENCODED = (
+    "https://hoa.texas.gov/certificates/12345/67890/mc/"
+    "%237%20Hyde%20Park%20--%20Management%20Certificate.pdf"
+)
+
+
+class TestNormalizeCertificateUrl:
+    def test_hash_in_filename_is_encoded_and_fragment_is_empty(self):
+        normalized = mod.normalize_certificate_url(_HASH_PDF_URL)
+
+        parts = urlsplit(normalized)
+        assert parts.fragment == ""
+        assert "%23" in parts.path
+        assert "#" not in normalized
+        assert normalized == _HASH_PDF_URL_ENCODED
+
+    def test_already_encoded_url_without_hash_is_unchanged(self):
+        raw = (
+            "https://hoa.texas.gov/certificates/12345/67890/mc/"
+            "Hyde%20Park%20--%20Management%20Certificate.pdf"
+        )
+        normalized = mod.normalize_certificate_url(raw)
+
+        assert normalized == raw
+        assert urlsplit(normalized).fragment == ""
+        assert unquote(urlsplit(normalized).path) == unquote(urlsplit(raw).path)
+
+    def test_already_encoded_hash_is_not_double_encoded(self):
+        raw = (
+            "https://hoa.texas.gov/certificates/12345/67890/mc/"
+            "%237%20Hyde%20Park.pdf"
+        )
+        assert mod.normalize_certificate_url(raw) == raw
+
+
 class TestFetchPdf:
     def test_ok_pdf_returns_bytes_and_consumes_one_slot(self):
         session = MagicMock()
@@ -329,6 +369,26 @@ class TestFetchPdf:
 
         assert fetched["review_reasons"] == "pdf_too_large"
         assert fetched["pdf_bytes"] is None
+
+    def test_hash_filename_is_requested_percent_encoded(self):
+        session = MagicMock()
+        response = MagicMock()
+        response.status_code = 200
+        response.content = b"%PDF-1.4\nbody"
+        response.raise_for_status = MagicMock()
+        session.get.return_value = response
+
+        fetched = mod.fetch_pdf(_HASH_PDF_URL, session, MagicMock())
+
+        assert fetched["status"] == "ok"
+        session.get.assert_called_once_with(
+            _HASH_PDF_URL_ENCODED,
+            timeout=mod._FETCH_TIMEOUT_S,
+        )
+        assert urlsplit(_HASH_PDF_URL_ENCODED).fragment == ""
+        requested = session.get.call_args.args[0]
+        assert "#" not in requested
+        assert "%23" in requested
 
 
 class TestRateLimiter:
@@ -600,6 +660,32 @@ class TestEnrich:
     def test_missing_queue_column_raises(self):
         with pytest.raises(ValueError, match="association_id"):
             mod.enrich(pd.DataFrame([{"url": "https://example.test"}]), sleep_s=0)
+
+    def test_enrich_assigns_juniper_user_agent(self):
+        """Overwrite requests' default UA. setdefault leaves python-requests,
+        and hoa.texas.gov returns HTTP 403 for that agent string.
+        """
+        df = _queue_df(_queue_row())
+        seen: dict[str, str] = {}
+
+        def _fake(row, **kwargs):
+            seen["ua"] = kwargs["session"].headers["User-Agent"]
+            return {
+                "source_id": "tx_trec_hoa",
+                "natural_key": row["association_id"],
+                "certificate_id": row["certificate_id"],
+                "enrich_status": "ok",
+                "needs_review": False,
+                "review_reasons": None,
+                "confidence": 1.0,
+            }
+
+        with patch.object(mod, "process_certificate", side_effect=_fake):
+            mod.enrich(df, sleep_s=0, land_raw=False)
+
+        assert seen["ua"] == mod.USER_AGENT
+        assert seen["ua"].startswith("juniper-hoa-pipeline/")
+        assert "python-requests" not in seen["ua"]
 
     def test_county_and_limit_filters(self):
         df = _queue_df(

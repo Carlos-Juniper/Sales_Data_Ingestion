@@ -23,6 +23,7 @@ import json
 import re
 import sys
 from typing import Any
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import pandas as pd
 import requests
@@ -132,6 +133,24 @@ def _clean_id(value: Any) -> str | None:
     return text_value
 
 
+def normalize_certificate_url(url: str) -> str:
+    """Rejoin a ``#`` filename into the path and percent-encode it.
+
+    ``urlsplit`` treats ``#`` as the fragment separator. TREC certificate
+    filenames often contain a literal ``#`` (for example
+    ``#7 Hyde Park -- Management Certificate.pdf``), so a raw URL is fetched
+    as a truncated path and hoa.texas.gov returns 403 or 404. A non-empty
+    fragment is part of the path. The path is unquoted and then quoted so
+    ``#`` becomes ``%23`` without double-encoding sequences such as ``%20``.
+    """
+    parts = urlsplit(url)
+    path = parts.path
+    if parts.fragment:
+        path = f"{path}#{parts.fragment}"
+    encoded_path = quote(unquote(path), safe="/")
+    return urlunsplit((parts.scheme, parts.netloc, encoded_path, parts.query, ""))
+
+
 def fetch_pdf(
     url: str,
     session: requests.Session,
@@ -141,9 +160,12 @@ def fetch_pdf(
 ) -> dict[str, Any]:
     """Download one certificate. Always consumes one rate-limit slot.
 
-    Returns pdf_bytes only when the body looks like a PDF and is under the
-    size cap. 404 is ``not_found``. Anything else is ``error``.
+    The URL is normalized first so a ``#`` in the filename is sent as
+    ``%23`` rather than dropped as a fragment. Returns pdf_bytes only when
+    the body looks like a PDF and is under the size cap. 404 is
+    ``not_found``. Anything else is ``error``.
     """
+    url = normalize_certificate_url(url)
     # Reserve a slot before the socket opens so concurrent workers cannot
     # burst past the configured rate. The sleep, if any, happens inside
     # acquire(); this call returns once the caller is allowed to proceed.
@@ -445,7 +467,10 @@ def enrich(
     sys.stderr.write(f"  hoa pdf enrich: {len(eligible):,} eligible rows\n")
     owned_session = session is None
     session = session or make_session()
-    session.headers.setdefault("User-Agent", USER_AGENT)
+    # Assignment, not setdefault. requests.Session already sets
+    # User-Agent: python-requests/…, and setdefault leaves that value in
+    # place. hoa.texas.gov returns HTTP 403 for the default requests UA.
+    session.headers["User-Agent"] = USER_AGENT
     limiter = RateLimiter(sleep_s)
 
     def _one(row: dict[str, Any]) -> dict[str, Any]:
