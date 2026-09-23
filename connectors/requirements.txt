@@ -1,3 +1,4 @@
+beautifulsoup4>=4.12  # hoa_gmaps_enrich / lib.website_contact mailto: link parsing
 google-cloud-storage>=2.10  # D7 raw landing; lazy-imported so absence is graceful
 pandas>=2.0,<3  # pandas 3.0 removed .str-on-all-NA-float behavior the connectors rely on
 pdf2image>=1.17.0  # render scanned TREC certificate PDFs; needs poppler-utils
@@ -9,4 +10,6 @@ pyyaml>=6.0
 rapidfuzz>=3.0
 requests>=2.31
 sqlalchemy>=2.0
+tenacity>=8.2  # lib.google_places retry-on-429/5xx for Places Text Search (a POST, so
+                # requests' Retry adapter doesn't apply -- see lib/http.py::make_session)
 urllib3>=2.0

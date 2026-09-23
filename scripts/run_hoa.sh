@@ -4,12 +4,15 @@
 # Stage order:
 #   1. TX TREC HOA          (Texas open data CSV, no key)
 #   2. TX TREC PDF OCR      (certificate queue from stage 1 → enrich_hoa_pdf_contact)
-#   3. core_apply           -> core.*
+#   3. hoa_gmaps_enrich     (Google Places supplemental phone/website/email lookup —
+#                            skips associations stage 2 already found a contact for)
+#   4. core_apply           -> core.*
 #
 # Required env vars:
 #   DATABASE_URL      — libpq connection string; composed below from DB_PASSWORD_SECRET
 #   HOA_DATA_GLOB     — glob matching TREC_HOA_Management_Certificates_*.csv files
 #                       (required; files must be pre-staged in the container or volume)
+#   GOOGLE_MAPS_API_KEY — Places API key for stage 3 (see .env.example)
 #   GCS_RAW_BUCKET    — GCS bucket for raw landing (default: juniper-ingest-raw)
 #   DISABLE_GCS       — set to "1" to skip GCS upload (local/CI use)
 #
@@ -21,6 +24,8 @@
 #   HOA_PDF_SLEEP      — seconds between certificate downloads (default 1.0)
 #   HOA_PDF_LIMIT      — process only the first N queue rows (metro slice / smoke)
 #   HOA_PDF_COUNTY     — process only this county_primary (e.g. HARRIS)
+#   HOA_GMAPS_WORKERS   — thread pool size for stage 3 (default: 4)
+#   HOA_GMAPS_RATE_PAUSE — min seconds between Places API request starts (default: 0.2)
 
 set -euo pipefail
 
@@ -49,7 +54,7 @@ echo "[hoa] working directory: ${WORK_DIR}" >&2
 #    tx_trec_hoa takes positional file paths (glob-expanded by the script, not
 #    the shell, because the connector calls glob.glob() on each pattern).
 # ---------------------------------------------------------------------------
-echo "[hoa] stage 1/3 — TX TREC HOA" >&2
+echo "[hoa] stage 1/4 — TX TREC HOA" >&2
 : "${HOA_DATA_GLOB:?HOA_DATA_GLOB must be set to glob matching TREC_HOA_Management_Certificates_*.csv}"
 
 ZCTA_ARGS=""
@@ -70,7 +75,7 @@ python -m hoa.tx_trec_hoa \
 #    Queue CSV from stage 1. Scanned certificates — OCR is the primary path.
 #    Cached ok rows (same certificate_id) are skipped inside the connector.
 # ---------------------------------------------------------------------------
-echo "[hoa] stage 2/3 — TX TREC PDF OCR enrich" >&2
+echo "[hoa] stage 2/4 — TX TREC PDF OCR enrich" >&2
 
 PDF_ARGS=(
     --queue "${WORK_DIR}/tx_trec_pdf_queue.csv"
@@ -89,9 +94,28 @@ fi
 python -m hoa.tx_trec_pdf_enrich "${PDF_ARGS[@]}"
 
 # ---------------------------------------------------------------------------
-# 3. core_apply -> core.*
+# 3. hoa_gmaps_enrich — Google Places supplemental phone/website/email lookup
+#    Fed stage 2's output so it can skip associations the certificate OCR
+#    already produced a usable mgmt_phone/mgmt_email for (per
+#    Ingestion-Plan-of-Action.md §5.3: a regulator filing outranks a Places
+#    guess). Places is a fallback for associations OCR came back empty on,
+#    plus a source of `website`, which the certificate often lacks.
 # ---------------------------------------------------------------------------
-echo "[hoa] stage 3/3 — core_apply" >&2
+echo "[hoa] stage 3/4 — Google Places enrichment" >&2
+: "${GOOGLE_MAPS_API_KEY:?GOOGLE_MAPS_API_KEY must be set (see .env.example)}"
+
+python -m hoa.hoa_gmaps_enrich \
+    --input "${WORK_DIR}/tx_trec_hoa.csv" \
+    --pdf-contact-csv "${WORK_DIR}/tx_trec_pdf_enriched.csv" \
+    --out "${WORK_DIR}/hoa_gmaps_enriched.csv" \
+    --write-db \
+    --workers "${HOA_GMAPS_WORKERS:-4}" \
+    --rate-pause "${HOA_GMAPS_RATE_PAUSE:-0.2}"
+
+# ---------------------------------------------------------------------------
+# 4. core_apply -> core.*
+# ---------------------------------------------------------------------------
+echo "[hoa] stage 4/4 — core_apply" >&2
 python -m lib.core_apply --run-id 0
 
 echo "[hoa] pipeline complete" >&2
