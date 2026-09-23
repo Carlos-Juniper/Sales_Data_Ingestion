@@ -5,6 +5,11 @@ Consumes the queue CSV from ``tx_trec_hoa.build_pdf_queue()``, downloads
 each certificate PDF, extracts contact fields (via pdfplumber or OCR), and
 writes results to ``staging.enrich_hoa_pdf_contact``.
 
+Field 5 is stored as ``hoa_name`` / ``hoa_mailing_address`` and, for
+compatibility, the joined blob ``assoc_mailing_address``. Field 6 is stored
+as ``mgmt_*`` and the deprecated ``rep_*`` aliases. Rows already in the
+table are filled by ``hoa.backfill_hoa_pdf_contact`` (no re-OCR).
+
 Parser logic lives in ``hoa.trec_certificate_parser``.
 PDF extraction (pdfplumber + OCR) lives in ``lib.pdf_ocr``.
 
@@ -82,11 +87,18 @@ _UPSERT_COLUMNS = [
     "certificate_id",
     "certificate_url",
     "assoc_mailing_address",
+    "hoa_name",
+    "hoa_mailing_address",
     "rep_name",
     "rep_mailing_address",
     "rep_phone",
     "rep_phone_normalized",
     "rep_email",
+    "mgmt_name",
+    "mgmt_mailing_address",
+    "mgmt_phone",
+    "mgmt_phone_normalized",
+    "mgmt_email",
     "website",
     "field_6_raw",
     "enrich_status",
@@ -101,11 +113,18 @@ _UPSERT_COLUMNS = [
 
 _TEXT_COLUMNS = [
     "assoc_mailing_address",
+    "hoa_name",
+    "hoa_mailing_address",
     "rep_name",
     "rep_mailing_address",
     "rep_phone",
     "rep_phone_normalized",
     "rep_email",
+    "mgmt_name",
+    "mgmt_mailing_address",
+    "mgmt_phone",
+    "mgmt_phone_normalized",
+    "mgmt_email",
     "website",
     "field_6_raw",
     "certificate_id",
@@ -224,11 +243,18 @@ def _blank_row(
         "certificate_id": certificate_id,
         "certificate_url": url,
         "assoc_mailing_address": None,
+        "hoa_name": None,
+        "hoa_mailing_address": None,
         "rep_name": None,
         "rep_mailing_address": None,
         "rep_phone": None,
         "rep_phone_normalized": None,
         "rep_email": None,
+        "mgmt_name": None,
+        "mgmt_mailing_address": None,
+        "mgmt_phone": None,
+        "mgmt_phone_normalized": None,
+        "mgmt_email": None,
         "website": None,
         "field_6_raw": None,
         "enrich_status": status,
@@ -545,6 +571,20 @@ def print_summary(df: pd.DataFrame) -> None:
         sys.stderr.write(
             f"    rep_email        {email_filled:>7,}  ({100 * email_filled / total:.1f}% filled)\n"
         )
+
+    # Product columns. rep_* above stays so existing log scrapers keep working.
+    for column in (
+        "hoa_name",
+        "hoa_mailing_address",
+        "mgmt_name",
+        "mgmt_phone",
+        "mgmt_email",
+    ):
+        if total > 0 and column in df.columns:
+            filled = int(df[column].notna().sum())
+            sys.stderr.write(
+                f"    {column:<22} {filled:>7,}  ({100 * filled / total:.1f}% filled)\n"
+            )
 
 
 # ---------------------------------------------------------------- db

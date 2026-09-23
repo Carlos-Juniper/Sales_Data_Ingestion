@@ -119,6 +119,33 @@ class TestParseTrinity:
             "PO Box 203310, Austin, TX 78720"
         )
 
+    def test_field_5_splits_hoa_name_and_mailing_address(self):
+        parsed = mod.parse_certificate_text(TRINITY_OCR)
+        assert parsed["hoa_name"] == "Trinity Estates POA, Inc."
+        assert parsed["hoa_mailing_address"] == (
+            "c/o Goodwin & Company, PO Box 203310, Austin, TX 78720"
+        )
+        # Legacy blob stays the joined field-5 text.
+        assert parsed["assoc_mailing_address"] == (
+            "Trinity Estates POA, Inc., c/o Goodwin & Company, "
+            "PO Box 203310, Austin, TX 78720"
+        )
+
+    def test_field_5_multiline_block_splits_before_join(self):
+        text = TRINITY_OCR.replace(
+            "Trinity Estates POA, Inc., c/o Goodwin & Company, PO Box 203310, Austin, TX 78720",
+            "Trinity Estates POA, Inc.\nc/o Goodwin & Company\nPO Box 203310\nAustin, TX 78720",
+        )
+        parsed = mod.parse_certificate_text(text)
+        assert parsed["hoa_name"] == "Trinity Estates POA, Inc."
+        assert parsed["hoa_mailing_address"] == (
+            "c/o Goodwin & Company, PO Box 203310, Austin, TX 78720"
+        )
+        assert parsed["assoc_mailing_address"] == (
+            "Trinity Estates POA, Inc., c/o Goodwin & Company, "
+            "PO Box 203310, Austin, TX 78720"
+        )
+
     def test_field_6_rep_name_address_phone_email(self):
         parsed = mod.parse_certificate_text(TRINITY_OCR)
         assert parsed["rep_name"] == "Goodwin & Company"
@@ -126,6 +153,14 @@ class TestParseTrinity:
         assert parsed["rep_phone"] == "855.289.6007"
         assert parsed["rep_phone_normalized"] == "8552896007"
         assert parsed["rep_email"] == "info@goodwin-co.com"
+
+    def test_field_6_dual_writes_mgmt_columns(self):
+        parsed = mod.parse_certificate_text(TRINITY_OCR)
+        assert parsed["mgmt_name"] == parsed["rep_name"] == "Goodwin & Company"
+        assert parsed["mgmt_mailing_address"] == parsed["rep_mailing_address"]
+        assert parsed["mgmt_phone"] == parsed["rep_phone"]
+        assert parsed["mgmt_phone_normalized"] == parsed["rep_phone_normalized"]
+        assert parsed["mgmt_email"] == parsed["rep_email"]
 
     def test_field_7_keeps_both_urls(self):
         parsed = mod.parse_certificate_text(TRINITY_OCR)
@@ -183,6 +218,8 @@ class TestParseReviewFlags:
         parsed = mod.parse_certificate_text(None)
         assert parsed["enrich_status"] == "not_found"
         assert parsed["rep_phone"] is None
+        assert parsed["hoa_name"] is None
+        assert parsed["mgmt_email"] is None
 
     def test_missing_anchors_is_not_found(self):
         parsed = mod.parse_certificate_text("This page has no numbered fields at all.\n")
@@ -220,6 +257,8 @@ https://example.com
         parsed = mod.parse_certificate_text(text)
         assert parsed["enrich_status"] == "ok"
         assert parsed["rep_name"] is None
+        assert parsed["mgmt_name"] is None
+        assert parsed["mgmt_email"] is None
         assert parsed["rep_phone"] is None
         assert parsed["needs_review"] is True
         assert "missing_field_6_anchor" in parsed["review_reasons"]
@@ -446,6 +485,9 @@ class TestProcessCertificate:
         assert result["source_id"] == "tx_trec_hoa"
         assert result["natural_key"] == "123456"
         assert result["rep_email"] == "info@goodwin-co.com"
+        assert result["mgmt_email"] == "info@goodwin-co.com"
+        assert result["hoa_name"] == "Trinity Estates POA, Inc."
+        assert result["assoc_mailing_address"]
         assert result["needs_review"] is False
         assert result["raw_pdf_uri"].endswith(".pdf.gz")
         assert result["raw_pdf_sha256"]
@@ -871,11 +913,18 @@ class TestUpsert:
             "certificate_id": "51-253",
             "certificate_url": "https://example.test/a.pdf",
             "assoc_mailing_address": "PO Box 1, Austin, TX 78720",
+            "hoa_name": "Sunrise HOA",
+            "hoa_mailing_address": "PO Box 1, Austin, TX 78720",
             "rep_name": "Goodwin & Company",
             "rep_mailing_address": "PO Box 1, Austin, TX 78720",
             "rep_phone": "855.289.6007",
             "rep_phone_normalized": "8552896007",
             "rep_email": "info@goodwin-co.com",
+            "mgmt_name": "Goodwin & Company",
+            "mgmt_mailing_address": "PO Box 1, Austin, TX 78720",
+            "mgmt_phone": "855.289.6007",
+            "mgmt_phone_normalized": "8552896007",
+            "mgmt_email": "info@goodwin-co.com",
             "website": "https://goodwin-co.com/",
             "field_6_raw": "Goodwin & Company",
             "enrich_status": "ok",
@@ -898,6 +947,19 @@ class TestUpsert:
             if column in {"source_id", "natural_key"}:
                 continue
             assert f"staging.enrich_hoa_pdf_contact.{column} IS DISTINCT FROM EXCLUDED.{column}" in sql
+        for column in (
+            "hoa_name",
+            "hoa_mailing_address",
+            "mgmt_name",
+            "mgmt_mailing_address",
+            "mgmt_phone",
+            "mgmt_phone_normalized",
+            "mgmt_email",
+            "assoc_mailing_address",
+            "rep_name",
+        ):
+            assert column in mod._UPSERT_COLUMNS
+            assert column in sql
 
     def test_returns_row_count_and_stamps_upstream_source_id(self):
         engine, conn = _mock_engine()
@@ -907,6 +969,9 @@ class TestUpsert:
         assert rows[0]["source_id"] == "tx_trec_hoa"
         assert rows[0]["natural_key"] == "123456"
         assert rows[0]["needs_review"] is False
+        assert rows[0]["hoa_name"] == "Sunrise HOA"
+        assert rows[0]["mgmt_name"] == "Goodwin & Company"
+        assert rows[0]["rep_name"] == "Goodwin & Company"
 
     def test_skipped_rows_are_not_written(self):
         engine, conn = _mock_engine()
@@ -956,6 +1021,55 @@ class TestUpsert:
         sql = str(conn.execute.call_args.args[0])
         assert "enrich_status = 'ok'" in sql
         assert "enrich_hoa_pdf_contact" in sql
+
+
+class TestSummaryAndBlankRow:
+    def test_summary_includes_hoa_and_mgmt_fill_counts(self, capsys):
+        df = pd.DataFrame([{
+            "enrich_status": "ok",
+            "needs_review": False,
+            "rep_phone": "855.289.6007",
+            "rep_email": None,
+            "hoa_name": "Sunrise HOA",
+            "hoa_mailing_address": None,
+            "mgmt_name": "Goodwin & Company",
+            "mgmt_phone": "855.289.6007",
+            "mgmt_email": "info@goodwin-co.com",
+        }])
+        mod.print_summary(df)
+        err = capsys.readouterr().err
+        assert "rep_phone" in err
+        assert "rep_email" in err
+        assert "hoa_name" in err
+        assert "hoa_mailing_address" in err
+        assert "mgmt_name" in err
+        assert "mgmt_email" in err
+
+    def test_blank_row_and_output_frame_include_new_columns(self):
+        row = mod._blank_row(
+            natural_key="1",
+            certificate_id="c",
+            url="https://example.test/a.pdf",
+            status="error",
+            reasons=["ocr_error"],
+        )
+        assert row["hoa_name"] is None
+        assert row["mgmt_email"] is None
+        assert row["assoc_mailing_address"] is None
+        assert row["rep_name"] is None
+        out = mod._output_frame(_queue_df())
+        for column in (
+            "hoa_name",
+            "hoa_mailing_address",
+            "mgmt_name",
+            "mgmt_mailing_address",
+            "mgmt_phone",
+            "mgmt_phone_normalized",
+            "mgmt_email",
+            "assoc_mailing_address",
+            "rep_email",
+        ):
+            assert column in out.columns
 
 
 class TestBatchExitCode:
@@ -1013,11 +1127,18 @@ class TestManifest:
             "certificate_id": "51-253",
             "certificate_url": "https://example.test/a.pdf",
             "assoc_mailing_address": None,
+            "hoa_name": None,
+            "hoa_mailing_address": None,
             "rep_name": None,
             "rep_mailing_address": None,
             "rep_phone": None,
             "rep_phone_normalized": None,
             "rep_email": None,
+            "mgmt_name": None,
+            "mgmt_mailing_address": None,
+            "mgmt_phone": None,
+            "mgmt_phone_normalized": None,
+            "mgmt_email": None,
             "website": None,
             "field_6_raw": None,
             "enrich_status": "error",
@@ -1083,3 +1204,22 @@ class TestWiring:
         assert "enriched_at" in sql
         assert "needs_review" in sql
         assert "WHERE needs_review" in sql
+
+    def test_migration_019_adds_hoa_and_mgmt_columns(self):
+        sql = Path(__file__).resolve().parents[3].joinpath(
+            "db", "migrations", "019_enrich_hoa_pdf_contact_hoa_mgmt.sql",
+        ).read_text()
+        for column in (
+            "hoa_name",
+            "hoa_mailing_address",
+            "mgmt_name",
+            "mgmt_mailing_address",
+            "mgmt_phone",
+            "mgmt_phone_normalized",
+            "mgmt_email",
+        ):
+            assert f"ADD COLUMN IF NOT EXISTS {column} text" in sql
+        assert "DROP COLUMN" not in sql.upper()
+        assert "deprecated alias" in sql.lower()
+        assert "assoc_mailing_address" in sql
+        assert "rep_name" in sql

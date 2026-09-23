@@ -7,10 +7,16 @@ and returns structured contact fields anchored on the numbered labels from
 the statutory template (Tex. Prop. Code §209.004):
 
   5. Name and mailing address of the Association
+     hoa_name, hoa_mailing_address
+     assoc_mailing_address — deprecated joined blob of the same block
   6. Name, mailing address, phone number & email for designated representative
+     mgmt_name, mgmt_mailing_address, mgmt_phone, mgmt_phone_normalized, mgmt_email
+     rep_* — deprecated aliases of those mgmt_* columns
   7. Website address where all dedicatory instruments can be found
 
 Public API: ``parse_certificate_text(text) -> dict``.
+Field 5 and field 6 share ``split_name_and_address`` (``_split_parts`` +
+``_name_and_address``). The legacy assoc blob stays the joined field-5 text.
 """
 
 from __future__ import annotations
@@ -240,6 +246,23 @@ def _name_and_address(parts: list[str]) -> tuple[str | None, str | None]:
     return _oneline(name_parts), _oneline(addr_parts)
 
 
+def split_name_and_address(block: str | None) -> tuple[str | None, str | None]:
+    """Split a field-5/6 block, or a stored ``assoc_mailing_address`` blob.
+
+    Multi-line text keeps one part per line, so a name can span lines until
+    the first address-like line (PO Box, c/o, street number, ZIP). A single
+    line — including the comma-joined blob written to
+    ``assoc_mailing_address`` — is split on commas. Phone and email are
+    removed by the caller before field 6 is passed here.
+    """
+    if block is None:
+        return None, None
+    text = str(block).strip()
+    if not text:
+        return None, None
+    return _name_and_address(_split_parts(text))
+
+
 def _join_assoc(block: str | None) -> str | None:
     if not block or not block.strip():
         return None
@@ -297,7 +320,7 @@ def _split_rep(block: str | None) -> dict[str, Any]:
     if phone_after:
         cleaned = cleaned[: phone_after.start()] + " " + cleaned[phone_after.end() :]
 
-    name, address = _name_and_address(_split_parts(cleaned))
+    name, address = split_name_and_address(cleaned)
     raw_stored, truncated = _truncate(re.sub(r"[ \t]+", " ", raw))
     return {
         "name": name,
@@ -359,17 +382,27 @@ def _parse_result(
     reasons: list[str],
     confidence: float,
     assoc: str | None = None,
+    hoa_name: str | None = None,
+    hoa_mailing_address: str | None = None,
     rep: dict[str, Any] | None = None,
     website: str | None = None,
 ) -> dict[str, Any]:
     rep = rep or _split_rep(None)
+    # rep_* stays populated as a deprecated alias of mgmt_*.
     return {
         "assoc_mailing_address": assoc,
+        "hoa_name": hoa_name,
+        "hoa_mailing_address": hoa_mailing_address,
         "rep_name": rep.get("name"),
         "rep_mailing_address": rep.get("address"),
         "rep_phone": rep.get("phone"),
         "rep_phone_normalized": rep.get("phone_normalized"),
         "rep_email": rep.get("email"),
+        "mgmt_name": rep.get("name"),
+        "mgmt_mailing_address": rep.get("address"),
+        "mgmt_phone": rep.get("phone"),
+        "mgmt_phone_normalized": rep.get("phone_normalized"),
+        "mgmt_email": rep.get("email"),
         "website": website,
         "field_6_raw": rep.get("raw"),
         "enrich_status": status,
@@ -418,10 +451,16 @@ def parse_certificate_text(text: str | None) -> dict[str, Any]:
         reasons.append("anchor_order")
 
     blocks = _blocks_from_anchors(text, anchors)
-    assoc, assoc_truncated = _truncate(_join_assoc(blocks.get(5)) if 5 in anchors else None)
+    field_5_block = blocks.get(5) if 5 in anchors else None
+    # Legacy blob stays the joined field-5 text. hoa_* is the same block
+    # split with the field-6 helper, before the lines are joined.
+    assoc, assoc_truncated = _truncate(_join_assoc(field_5_block))
+    hoa_name, hoa_mailing_address = split_name_and_address(field_5_block)
+    hoa_name, hoa_name_truncated = _truncate(hoa_name)
+    hoa_mailing_address, hoa_addr_truncated = _truncate(hoa_mailing_address)
     rep = _split_rep(blocks.get(6)) if 6 in anchors else _split_rep(None)
     website, web_truncated = _truncate(_extract_website(blocks.get(7)) if 7 in anchors else None)
-    if assoc_truncated or web_truncated:
+    if assoc_truncated or hoa_name_truncated or hoa_addr_truncated or web_truncated:
         reasons.append("value_truncated")
 
     if 6 in anchors:
@@ -445,6 +484,8 @@ def parse_certificate_text(text: str | None) -> dict[str, Any]:
         reasons=reasons,
         confidence=confidence,
         assoc=assoc,
+        hoa_name=hoa_name,
+        hoa_mailing_address=hoa_mailing_address,
         rep=rep,
         website=website,
     )

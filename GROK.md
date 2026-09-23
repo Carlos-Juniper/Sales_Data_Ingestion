@@ -53,7 +53,7 @@ instead of one site at a time.
 
 ### HOA (`connectors/hoa/`)
 - **TX TREC Management Certificates** — `data.texas.gov`, statewide bulk CSV, ~17k associations. Mandatory filing under Tex. Prop. Code §209.004. Gives a clean 1:1 registry (name, type, city, ZIP) but **no street address, phone, or management company**. (`tx_trec_hoa.py`)
-- **TX TREC certificate PDF OCR** — separate slow pass over `build_pdf_queue()` output. Certificates are scanned images, so the connector OCRs them and anchors on the numbered field-5/6/7 labels. Contact fields land in `staging.enrich_hoa_pdf_contact` (not `core.*`); low-confidence parses set `needs_review`. (`tx_trec_pdf_enrich.py`)
+- **TX TREC certificate PDF OCR** — separate slow pass over `build_pdf_queue()` output. Certificates are scanned images, so the connector OCRs them and anchors on the numbered field-5/6/7 labels. Contact fields land in `staging.enrich_hoa_pdf_contact` (not `core.*`). Field 5 is `hoa_name` and `hoa_mailing_address` (legacy joined blob `assoc_mailing_address` kept as a deprecated alias). Field 6 is `mgmt_name`, `mgmt_mailing_address`, `mgmt_phone`, `mgmt_phone_normalized`, and `mgmt_email` (legacy `rep_*` aliases). Low-confidence parses set `needs_review`. (`tx_trec_pdf_enrich.py`; offline fill of rows already stored is `backfill_hoa_pdf_contact.py`.)
 - FL/NC/SC/PA are explicitly deferred — no state HOA registry exists comparable to TX's; FL's path runs through Sunbiz bulk corporate data + statewide parcels, not yet built.
 
 ### Deathcare (`connectors/deathcare/`)
