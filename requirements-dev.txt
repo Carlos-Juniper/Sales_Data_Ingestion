@@ -1,0 +1,2 @@
+-r connectors/requirements.txt
+pytest>=8,<9
