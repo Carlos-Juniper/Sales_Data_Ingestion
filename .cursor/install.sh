@@ -132,7 +132,14 @@ PY
       --without-raster \
       --without-topology \
       --without-protobuf
-    make -j"$(nproc)"
+    # utils/ generates extension SQL through shared *.sql.tmp files. A parallel
+    # make races those rules (empty rtpostgis.sql, then "Unable to locate target
+    # new version number") even when raster and topology are disabled. Compile
+    # the libraries in parallel, then finish the SQL serially.
+    make -j"$(nproc)" -C liblwgeom
+    make -j"$(nproc)" -C libpgcommon
+    make -j"$(nproc)" -C postgis
+    make -j1
     sudo make install
   )
   rm -rf "$src" "$tarball"
