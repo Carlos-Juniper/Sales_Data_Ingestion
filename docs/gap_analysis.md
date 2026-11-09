@@ -20,7 +20,7 @@ HOA vertical only (no healthcare, deathcare, parks/municipal, or resort/hospital
 | `scrapers/sunbiz.py` + `jobs/sunbiz_backfill.py` | Pulls active FL non-profit corps from **sunbizdaily.com**, a third-party paid API (rate-limited 1000 req/hr, `SUNBIZ_API_KEY`) | Plan (§6.2) calls for the **free public Sunbiz SFTP bulk file**, not a paid third-party API — different source, different licensing story |
 | `scrapers/dbpr.py` + `jobs/dbpr_backfill.py` | Fetches/parses a DBPR condo CSV, joins to `hoa_properties` on name+zip/city | Loosely matches plan §6.2 "DBPR condo/co-op extracts," but joins into a flat property table, not the plan's account/location schema |
 | `scrapers/fl_county_acreage.py` + backfill job | Per-county (Pinellas, Polk; Sarasota/Seminole pending) ArcGIS parcel lookups for acreage | A narrow, manual version of the plan's general "geocode → join parcels → derive acreage" idea, applied ad hoc rather than as reusable infra |
-| `jobs/gmaps_enrich.py` | Google Maps Places lookup + website email-scraping for management-company contact info | **Not in the plan.** The plan explicitly avoids Esri/Google geocoding spend (§3) and treats TX contact gaps as a PDF-parsing problem (§6.1.1), not a Maps-enrichment problem |
+| `jobs/gmaps_enrich.py` | Google Maps Places lookup + website email-scraping for management-company contact info | **Not in the plan.** The plan explicitly avoids Esri/Google geocoding spend (§3) and treats TX contact gaps as a PDF-parsing problem (§6.2.1), not a Maps-enrichment problem |
 | `jobs/management_company_dedup.py` | Merges `[PENDING]` placeholder rows into real-name rows via zip + fuzzy address match (rapidfuzz) | A narrow instance of the plan's §5 resolution system — no blocking-key framework, no tiered match/score/threshold pipeline, no `review.match_queue` |
 | `jobs/import_hoa_csv.py`, `jobs/clean_hoa_csv.py` | Manual CSV import/cleanup for hand-collected management-company lists | Not in the plan |
 | `jobs/orchestrate_pipeline.py` | Runs arcgis → dbpr → gmaps in sequence, with run tracking (`db.start_run`/`finish_run`) | A real but much thinner version of the plan's 5-stage Extract→Land→Stage→Resolve→Serve architecture (§3) — no immutable GCS landing, no per-source manifest with SHA-256/license string |
@@ -32,13 +32,13 @@ HOA vertical only (no healthcare, deathcare, parks/municipal, or resort/hospital
 ## What the plan describes that has zero repo footprint
 
 - Healthcare, Deathcare, Parks/Municipal, Resort/Hospitality verticals — entirely absent.
-- Texas HOA via **TREC bulk CSV + certificate PDFs** (§6.1.1) — repo instead scrapes ArcGIS parcels for HOA discovery.
+- Texas HOA via **TREC bulk CSV + certificate PDFs** (§6.2.1) — repo instead scrapes ArcGIS parcels for HOA discovery.
 - Free Sunbiz **SFTP bulk file** — repo pays a third-party API instead.
 - GCS raw immutable landing zone, `ingest.source_run` manifest with SHA-256 + license string, Cloud SQL/PostGIS, the tiered entity-resolution engine (§5.1), ArcGIS Hub harvester for parks (§6.4), FSQ OS Places, NSD/IRS BMF/CMS sources, SAM.gov procurement monitoring.
 
 ## The one direct overlap: local `connectors/` directory
 
-`connectors/tx_trec_hoa.py` and `connectors/fl_dbpr_lodging.py` in this local project **are** the plan-described connectors referenced in §6.1.1 and §6.5.1 — they implement the TREC CSV and DBPR lodging logic the plan calls for. But:
+`connectors/tx_trec_hoa.py` and `connectors/fl_dbpr_lodging.py` in this local project **are** the plan-described connectors referenced in §6.2.1 and §6.5.1 — they implement the TREC CSV and DBPR lodging logic the plan calls for. But:
 
 - They are **untracked in local git** (`git status` shows `?? connectors/`) — never committed here.
 - They do **not exist in the GitHub repo at all** (confirmed via full tree listing).
