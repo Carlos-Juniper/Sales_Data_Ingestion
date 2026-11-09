@@ -357,7 +357,8 @@ class TestEnrichPdfContactGate:
     """
     The OCR pass (tx_trec_pdf_enrich.py) outranks Places per plan §5.3.
     pdf_contact_df, when given, must suppress a Places lookup for any
-    natural_key it already has a real mgmt_phone/mgmt_email for.
+    natural_key it already has a real mgmt_phone for. An OCR email alone
+    does not suppress the lookup — Places is the phone source.
     """
 
     def _pdf_contact_df(self, **overrides) -> pd.DataFrame:
@@ -375,15 +376,17 @@ class TestEnrichPdfContactGate:
         mock_client_cls.return_value.lookup_business.assert_not_called()
         assert out["enrich_status"].iloc[0] == "skipped"
 
-    def test_skips_row_already_covered_by_pdf_email(self):
+    def test_enriches_row_with_pdf_email_but_no_phone(self):
         df = _make_canonical_df()
         pdf_df = self._pdf_contact_df(mgmt_phone=None, mgmt_email="board@sunsetridgehoa.example.com")
+        client = _mock_places_client()
 
-        with patch("hoa_gmaps_enrich.GooglePlacesClient") as mock_client_cls:
-            out = mod.enrich(df, api_key="fake-key", workers=1, pdf_contact_df=pdf_df)
+        with patch("hoa_gmaps_enrich.GooglePlacesClient", return_value=client):
+            with patch("hoa_gmaps_enrich.extract_emails_from_website", return_value=[]):
+                out = mod.enrich(df, api_key="fake-key", workers=1, pdf_contact_df=pdf_df)
 
-        mock_client_cls.return_value.lookup_business.assert_not_called()
-        assert out["enrich_status"].iloc[0] == "skipped"
+        client.lookup_business.assert_called_once()
+        assert out["enrich_status"].iloc[0] == "ok"
 
     def test_enriches_row_absent_from_pdf_contact_df(self):
         df = _make_canonical_df()

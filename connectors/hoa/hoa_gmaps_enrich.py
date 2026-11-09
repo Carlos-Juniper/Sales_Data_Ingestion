@@ -12,8 +12,8 @@ contact email.
 
 This is a supplemental pass that runs AFTER ``tx_trec_pdf_enrich.py`` and
 defers to it: pass ``--pdf-contact-csv`` (that connector's ``--out`` CSV) and
-any association it already produced a usable ``mgmt_phone``/``mgmt_email``
-for is skipped here — per ``Ingestion-Plan-of-Action.md`` §5.3, a state
+any association it already produced a usable ``mgmt_phone`` for is skipped
+here (an OCR email alone does not count — Places is the phone source) — per ``Ingestion-Plan-of-Action.md`` §5.3, a state
 regulator's own filing outranks a Places API guess. Places fills the gap for
 associations OCR came back empty on, plus supplies ``website``, which the
 certificate often lacks. ``--pdf-contact-csv`` is optional; without it, every
@@ -55,8 +55,8 @@ Status handling
   - ``skipped``   — row's ``contact_status`` isn't ``'pending_pdf'`` (mirrors
                     the BMF ``segment``+``ein`` mask pattern in
                     ``irs_990_enrich.enrich()``), OR ``pdf_contact_df`` was
-                    given and already carries a usable ``mgmt_phone``/
-                    ``mgmt_email`` for this association's ``natural_key``.
+                    given and already carries a usable ``mgmt_phone``
+                    for this association's ``natural_key``.
   - ``not_found`` — Places returned zero results, OR it matched a place but
                     that place had neither a phone nor a website (there's
                     nothing to write in either case, and the enum has no
@@ -99,17 +99,14 @@ _REQUIRED_INPUT_COLUMNS = {
 }
 
 # Columns tx_trec_pdf_enrich.py's --out CSV must carry for the OCR-completeness
-# check below. natural_key is the join key; mgmt_phone/mgmt_email are what
-# "already has a real contact" means for that pass (see trec_certificate_parser.py).
-PDF_CONTACT_REQUIRED_COLUMNS = {"natural_key", "mgmt_phone", "mgmt_email"}
+# check below. natural_key is the join key; mgmt_phone is what "already has a
+# phone" means for that pass (see trec_certificate_parser.py).
+PDF_CONTACT_REQUIRED_COLUMNS = {"natural_key", "mgmt_phone"}
 
 
-def _has_pdf_contact(mgmt_phone: Any, mgmt_email: Any) -> bool:
-    """True when the OCR pass already produced a usable phone or email."""
-    return bool(
-        (isinstance(mgmt_phone, str) and mgmt_phone.strip())
-        or (isinstance(mgmt_email, str) and mgmt_email.strip())
-    )
+def _has_pdf_phone(mgmt_phone: Any) -> bool:
+    """True when the OCR pass already produced a usable phone."""
+    return isinstance(mgmt_phone, str) and bool(mgmt_phone.strip())
 
 
 # ---------------------------------------------------------------- per-row lookup
@@ -237,9 +234,8 @@ def enrich(
         shared across all worker threads (see ``lib.google_places.RateLimiter``).
     pdf_contact_df:
         Optional DataFrame from ``tx_trec_pdf_enrich.py``'s ``--out`` CSV
-        (must contain ``natural_key``, ``mgmt_phone``, ``mgmt_email``). Rows
-        whose ``natural_key`` already has a non-empty ``mgmt_phone`` or
-        ``mgmt_email`` there are treated as already covered by the OCR pass
+        (must contain ``natural_key``, ``mgmt_phone``). Rows whose
+        ``natural_key`` already has a non-empty ``mgmt_phone`` there are treated as already covered by the OCR pass
         and skipped here, per the survivorship rule in the module docstring.
         A ``natural_key`` absent from this frame (OCR hasn't produced a
         result for it yet, or produced an empty one) remains eligible. When
@@ -265,20 +261,19 @@ def enrich(
 
     if pdf_contact_df is not None:
         pdf_lookup = (
-            pdf_contact_df[["natural_key", "mgmt_phone", "mgmt_email"]]
+            pdf_contact_df[["natural_key", "mgmt_phone"]]
             .drop_duplicates(subset="natural_key", keep="last")
             .set_index("natural_key")
         )
         already_covered = df["natural_key"].map(
-            lambda nk: _has_pdf_contact(
-                pdf_lookup.at[nk, "mgmt_phone"] if nk in pdf_lookup.index else None,
-                pdf_lookup.at[nk, "mgmt_email"] if nk in pdf_lookup.index else None,
+            lambda nk: _has_pdf_phone(
+                pdf_lookup.at[nk, "mgmt_phone"] if nk in pdf_lookup.index else None
             )
         )
         eligible_mask = eligible_mask & ~already_covered
         sys.stderr.write(
             f"  hoa_gmaps_enrich: {int(already_covered.sum()):,} rows already "
-            "have an OCR-sourced contact — skipping those\n"
+            "have an OCR-sourced phone — skipping those\n"
         )
 
     eligible_idx = df.index[eligible_mask].tolist()
@@ -428,7 +423,7 @@ def main() -> None:
         default=None,
         metavar="CSV_PATH",
         help="Path to tx_trec_pdf_enrich.py's --out CSV. When given, associations "
-             "it already found a usable mgmt_phone/mgmt_email for are skipped here "
+             "it already found a usable mgmt_phone for are skipped here "
              "(the OCR filing outranks a Places guess — see module docstring). "
              "Optional but strongly recommended once the OCR pass has run.",
     )
