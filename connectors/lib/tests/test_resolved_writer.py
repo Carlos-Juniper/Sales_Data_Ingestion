@@ -243,7 +243,7 @@ class TestUpsertBoundaries:
         upsert_boundaries(engine, "x", [{
             "source_id": "s", "natural_key": "k", "geojson": None,
         }])
-        assert "CASE WHEN :geojson IS NULL THEN NULL" in calls[0][0]
+        assert "CASE WHEN CAST(:geojson AS text) IS NULL THEN NULL" in calls[0][0]
 
     def test_duplicate_conflict_keys_collapsed(self):
         """ON CONFLICT DO UPDATE raises 'cannot affect row a second time' if one
