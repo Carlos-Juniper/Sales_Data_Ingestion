@@ -72,9 +72,9 @@ layout profile like plan §6.2.1 before a connector is written.
 | F2 | **DBPR condominium extract** | Project rows + managing-entity rows | Condo projects with **unit counts**; managing association with fund revenue/expense | DBPR project no. | Verify |
 | F3 | **DBPR cooperative extract** | Project rows + managing entity | Same as F2 for Ch. 719 co-ops (includes resident-owned manufactured-home communities) | DBPR project no. | Verify |
 | F4 | **DBPR CAM firm licensees** | One row per licensed firm | Management companies — frequently the buyer | CAM firm license no. | Verify |
-| F5 | **DBPR CAM individual licensees** | One row per licensed manager | The named manager; links people to firms | CAM license no. | Verify |
-| F6 | **FDOR tax roll (NAL) — DOR use code 09** | One row per parcel, per county | Parcels classed "Residential Common Elements/Areas" — the precise filter for association-owned common area. Owner name/address, situs address, land sq ft | Parcel id | Verify |
-| F7 | **Florida Statewide Cadastral** (ArcGIS) | One polygon per parcel | Common-area geometry and acreage for F6 parcels | `PARCELNO` | Already configured in `connectors/healthcare/config/parcel_layers.yaml` |
+| F5 | **DBPR CAM individual licensees** | One row per licensed manager | The named manager. Name and city only, **no employer field**, so it cannot link a person to a firm | CAM license no. | Verified 2026-11-09 |
+| F6 | **FDOR tax roll (NAL) — DOR use code 09** | One row per parcel, per county | Fallback only. F7 carries the same roll fields (see below) | Parcel id | Fallback |
+| F7 | **Florida Statewide Cadastral** (ArcGIS) | One polygon per parcel | Code-09 common-area parcels with geometry, acreage, owner name and owner mailing address (`C/O <management firm>` when managed) | `PARCEL_ID` | Verified 2026-11-09; already in `connectors/healthcare/config/parcel_layers.yaml` |
 | F8 | **County HOA / subdivision boundary layers** | Per county, varies | Actual HOA boundaries where a county publishes them (Volusia does: `maps.vcgov.org/gis/data/HomeOwnerAssoc.htm`) | County-specific | Survey which counties publish |
 | F9 | **Google Places** | One lookup per association | Phone and website fallback | Place id | Reuse `hoa_gmaps_enrich.py` |
 
@@ -98,9 +98,23 @@ Source locations:
   Use the certified final roll, not the preliminary one. Some counties use
   4-digit sub-codes (Polk: `0900` vacant common elements, `0901` improved), so
   match on the first two digits.
-- **F7** — `services9.arcgis.com/Gh9awoU677aKree0/arcgis/rest/services/Florida_Statewide_Cadastral/FeatureServer/0`.
-  **Check first whether this layer carries `DOR_UC` itself.** If it does, F6
-  can be a single statewide ArcGIS query instead of 67 county downloads.
+- **F7** — `services9.arcgis.com/Gh9awoU677aKree0/arcgis/rest/services/Florida_Statewide_Cadastral/FeatureServer/0`
+  (layer `CADASTRAL_DOR`). **Verified 2026-11-09: it carries the tax roll
+  fields**, including `DOR_UC`, `PA_UC`, `PARCEL_ID`, `CO_NO`, `OWN_NAME`,
+  `OWN_ADDR1`, `OWN_CITY`, `OWN_ZIPCD`, `PHY_ADDR1`, `PHY_ZIPCD`, `LND_SQFOOT`,
+  `NO_RES_UNT`, `S_LEGAL`. So F6 comes from F7, not 67 NAL downloads. Query
+  rules found while testing:
+  - `DOR_UC` is a zero-padded string: filter `DOR_UC='009'`, not `'09%'`.
+  - A filter on `DOR_UC` alone is rejected; scope each query by `CO_NO`
+    (Hillsborough = 39). One query set per county, paged at 2,000 rows
+    (Hillsborough has 10,753 code-009 parcels).
+  - Leading-wildcard `LIKE '%x%'` is rejected; use prefix `LIKE 'x%'`.
+  - The layer returns duplicate rows per parcel; dedupe on `PARCEL_ID`.
+  - `OWN_NAME` is cut at 30 characters and spelled inconsistently
+    (`HUNTER'S GREEN COMMUNITY ASSOC`, `HUNTERS GREEN COMMUNITY ASSOCI`,
+    `HUNTER'S GREEN COMM ASSOCIATIO`). Match on a normalized prefix.
+- **F1 web search** (`search.sunbiz.org`) sits behind a Cloudflare challenge.
+  Do not scrape it; use the SFTP files.
 
 ### 2.2 Sources considered and skipped
 
@@ -117,19 +131,25 @@ Source locations:
 ## 3. Account model
 
 - **Account** = the association (`vertical='hoa'`, `account_type='association'`).
+  Sub-associations (e.g. "Hunters Green Parcel 10 Neighborhood Assoc") are
+  their own accounts with a parent link to the master association.
   Anchor key `sunbiz_doc`, already in `DEFAULT_ACCOUNT_KEY_PRIORITY`
   (`connectors/lib/keys.py`). DBPR project number goes in `external_keys` as a
   secondary key.
 - **Locations** = common-area parcels (F6/F7) and, for condos/co-ops, the
   project site. One association can own many parcels.
-- **Contacts** = officers and registered agent from F1; the managing CAM firm
-  and manager from F4/F5; phone/website from F9.
+- **Management firm = its own account** (`account_type='management_company'`,
+  anchor key `dbpr_cab_license`), linked to each association it manages with a
+  relationship row (role `manages`, `source`, `as_of`). Decided 2026-11-09.
+  Its staff are contacts on the firm account, not on the association.
+- **Contacts** = officers and registered agent from F1; managers from F5;
+  phone/website from F9.
 - `size_metric` = units (F2/F3) where known, otherwise common-area acres
   (F7 `LND_SQFOOT`).
 
-Open: whether the management firm is its own account linked to many
-associations, or only a contact on each. The CRM treats management companies as
-accounts, so the cutover favors its own account. Decide before F4 lands.
+Current manager comes from the newest source. The tax roll's `C/O` address
+can lag a manager change by a year or more (see §8: the roll still names Wise
+Property Management on 8 of 23 Hunters Green parcels).
 
 ---
 
@@ -142,7 +162,8 @@ accounts, so the cutover favors its own account. Decide before F4 lands.
 | F6 parcel owner → F1 | Normalized `OWN_NAME` vs association name, same county; boost when `OWN_ADDR1` matches F1 mailing/agent address | 2 or 3 |
 | F6 → F7 | `PARCEL_ID` ↔ `PARCELNO` (normalize county formatting) | 1 |
 | F1 registered agent → F4 firm | Agent name/address vs CAM firm name/address | 3 |
-| F5 manager → F4 firm | Firm license number on the individual record (verify) | 1 |
+| F7 owner `C/O <firm>` → F4 firm | Firm name after `C/O`, normalized, vs CAB license name; boost on mailing address match | 2 |
+| F5 manager → F4 firm | Not possible from DBPR: the individual record has no employer. Comes from CRM/Aspire contacts or the firm's site | — |
 
 **Recall.** The name regex misses associations named only for the subdivision
 ("Sawgrass Landing, Inc."). Recover them in two ways:
@@ -181,14 +202,17 @@ Ordered. Each step has a done-when.
 1. **Profile F1.** Pull one quarterly part over SFTP, parse 1,000 records
    against `cor.html`, count non-profits and regex hits statewide. *Done when*
    the profile, with fill rates, is written up here.
-2. **Profile F2–F5.** Download each DBPR file, record columns, row grain,
+2. **Profile F2–F5.** F4/F5 partly done: `lic38cam.csv` (5 MB, 28,907 rows)
+   mixes record types `CAB` (firm, 2,070), `CAM` (person, 19,575) and course
+   providers (`CRSE`, `PROV`, `PRE`), so filter on type. It holds current
+   licenses only; `cams.csv` (122 MB) is the full history. Download each DBPR file, record columns, row grain,
    duplicate behavior (the lodging extract was one row per unit — check for the
    same trap), and whether F2/F3 carry a Sunbiz doc number. *Done when* each
    has a layout table here.
-3. **Profile F6/F7.** Check whether F7 carries `DOR_UC`. Count code-09 parcels
-   for one county, and what share of their owner names look like associations.
-   *Done when* the F6 source decision (statewide layer vs county NAL files) is
-   recorded here.
+3. ~~**Profile F6/F7.**~~ Done 2026-11-09: F7 carries `DOR_UC`; F6 comes from
+   F7 (§2.1). Still to do: the share of code-009 owner names that look like
+   associations (Hillsborough 33647 sample: 37 distinct owners, roughly half
+   associations, the rest utilities, developers and trusts).
 4. **Survey F8.** List which Florida counties publish an HOA or subdivision
    boundary layer. *Done when* there is a county list with URLs.
 
@@ -216,8 +240,9 @@ Ordered. Each step has a done-when.
     phone.
 12. Add Florida stages to `scripts/run_hoa.sh` behind a `HOA_STATES` switch, so
     Texas runs are unchanged.
-13. **Pilot one metro end to end** (where Juniper has branches), then review
-    the output with sales before running statewide.
+13. **Pilot: Hunters Green, Tampa North (Hillsborough, ZIP 33647)** end to end,
+    scored against the Aspire record in §8, then all code-009 parcels in
+    33647, then review the output with sales before running statewide.
 
 **Phase 4 — statewide.**
 
@@ -228,11 +253,43 @@ Ordered. Each step has a done-when.
 
 ## 7. Open questions
 
-1. Management firm as account or contact (§3).
-2. Pilot metro.
+1. ~~Management firm as account or contact.~~ Own account (§3).
+2. ~~Pilot metro.~~ Hunters Green / Tampa North (§8).
 3. Do F2/F3 carry a Sunbiz doc number? This decides whether the condo link is
    tier 1 or tier 2.
-4. Does F7 carry `DOR_UC`? This decides whether F6 needs 67 downloads.
-5. Officer addresses in F1 are often home addresses. Use them for matching
+4. ~~Does F7 carry `DOR_UC`?~~ Yes (§2.1).
+5. Officer addresses in F1 (board members and registered agent) are often
+   home addresses. Use them for matching
    only. Do not surface them as contact addresses without a decision on
    outreach policy (CAN-SPAM/TCPA notes in the CRM workstreams plan).
+
+---
+
+## 8. Pilot example: Hunters Green (Aspire vs public sources)
+
+Hunters Green Community Association, Tampa 33647, branch Tampa North
+Maintenance. A single-family master HOA (Ch. 720) with sub-associations, so it
+is the hardest Florida case: not in the DBPR condo files, known only through
+Sunbiz, the tax roll and the CAM licenses. Aspire is the ground truth. Checked
+2026-11-09.
+
+| Item | Aspire | Public sources | Result |
+|---|---|---|---|
+| Association | Company 378649 "Hunters Green Community Association" | F7: 23 Hillsborough parcels owned under 4 name spellings, ~590 acres, mostly `DOR_UC 009` | Found; name normalization required |
+| HQ / common area address | 9456 Highland Oaks Drive, Tampa 33647 (properties 704396, 704482) | F7 owner address `9456 HIGHLAND OAK DR` on 12 parcels | Match |
+| Geolocation | None on any of the three properties | F7 polygons; HQ parcel centroid ~28.1300, -82.3466 | Public fills an Aspire gap |
+| Current manager | RealManage (filed twice: companies 356401 and 207797) | F4 `REALMANAGE LLC`, CAB3372, PO Box 803555 Dallas 75380; F7 `C/O REALMANAGE DALLAS 75380` on 3 parcels | Match, one firm account |
+| Previous manager | Wise Property Management (371455), still linked | F4 CAB448; F7 `C/O WISE PROPERTY MANAGEMENT` on 8 parcels (~440 acres) | Both sources stale; newest source wins |
+| Sub-association | Property 706672 "Wynstone @ Hunters Green", managed by New Tampa Property Management | F7 `WYNSTONE NEIGHBORHOOD ASSOC IN`, `C/O NEW TAMPA PROPERTY MANAGEMENT`; F4 CAB2519 | Match. Public also finds Parcel 3, 6, 7, 10 neighborhood associations Aspire does not have (managers incl. Unique Property Services CAB3665) |
+| Named managers | 7 contacts; 2 labeled LCAM (Peterson, Finnerty) | F5 current-license file finds 2 of 7 (Chiorando, Lusk); none of the LCAM-labeled ones | People come from CRM, not DBPR |
+| Phone / email | Front desk 813-991-4818, business emails | None in F1/F4/F5/F7 | Needs F9 or CRM |
+| Sunbiz doc number | Not stored | Not checked: web search blocked; comes with F1 SFTP profile | Open |
+
+Aspire data issues this exposes, for workstream A: RealManage exists as two
+companies; RealManage staff are filed under the association instead of the
+firm; the replaced manager is still linked; no geolocation.
+
+Pilot pass criteria: the pipeline produces one master association account
+with the 23 parcels, a parent link from each sub-association, one RealManage
+firm account, the Sunbiz doc number, and a manager relationship that agrees
+with Aspire.
