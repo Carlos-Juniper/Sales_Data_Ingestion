@@ -80,12 +80,19 @@ layout profile like plan §6.2.1 before a connector is written.
 
 Source locations:
 
-- **F1** — `dos.fl.gov/sunbiz/other-services/data-downloads/`. Public SFTP at
-  `sftp.floridados.gov`; the public login is published on that page. Fixed-width
-  ASCII, 1,440-char records, quarterly full file in 10 parts (>1 GB) plus daily
-  deltas. Layout: `dos.sunbiz.org/data-definitions/cor.html`. No phone, no
-  email, no NAICS. Use the free SFTP, not the paid `sunbizdaily.com` API the old
-  repo used.
+- **F1** — **Sunbiz Daily API** (`www.sunbizdaily.com/api/v1`), which we
+  already pay for. Key `SUNBIZ_API_KEY`, header `X-API-Key`. The old repo
+  (`juniperlandscaping/juniper-crm-HOA-pipeline`, `scrapers/sunbiz.py`) shows
+  how it works:
+  - `GET /filings/?filing_type=DOMNP&state=FL&zip=<prefix>` lists active
+    Florida non-profits (~23.8k as of 2026-06). Pages are capped at
+    100 × 100, so the old code splits by ZIP prefix (`32`, `330`–`339`, `34`).
+  - `GET /filings/<corporation_number>/` returns one filing's detail. Phase 0
+    must confirm it carries officers, registered agent and addresses.
+  - Rate limit 1,000 req/hr; the old code pauses 7.5 s per request.
+
+  Fallback if the API lacks a field: the state's free SFTP
+  (`sftp.floridados.gov`, fixed-width, layout `dos.sunbiz.org/data-definitions/cor.html`).
 - **F2, F3** — `www2.myfloridalicense.com/condos-timeshares-mobile-homes/public-records/`.
   The page lists column headers per file and a ReadMe. Terminated, rejected and
   withdrawn projects are not included.
@@ -114,14 +121,13 @@ Source locations:
     (`HUNTER'S GREEN COMMUNITY ASSOC`, `HUNTERS GREEN COMMUNITY ASSOCI`,
     `HUNTER'S GREEN COMM ASSOCIATIO`). Match on a normalized prefix.
 - **F1 web search** (`search.sunbiz.org`) sits behind a Cloudflare challenge.
-  Do not scrape it; use the SFTP files.
+  Do not scrape it; use the API.
 
 ### 2.2 Sources considered and skipped
 
 | Source | Why skipped |
 |---|---|
 | DBPR mobile home park extract | Parks are mostly owned by a landlord company, not an HOA buyer. Resident-owned communities are set up as co-ops or condos and arrive through F2/F3. |
-| `sunbizdaily.com` API | Paid third-party wrapper over F1, which is free. |
 | DBPR SIRS reporting database | Lists condos that filed a structural reserve study. Shows submissions as entered, and no bulk download is confirmed. Adds nothing F2 lacks except a filing flag. Revisit only if F2 proves stale. |
 | DBPR timeshare extract | Belongs to the resort vertical (plan §8 item 7), not HOA. |
 | Old HOA repo code (`scrapers/dbpr.py`, `fl_county_acreage.py`, `management_company_dedup.py`) | Writes a flat MySQL schema. Copy the matching rules (DBPR name+ZIP join, `[PENDING]` management-company merge), not the code. |
@@ -139,9 +145,14 @@ Source locations:
 - **Locations** = common-area parcels (F6/F7) and, for condos/co-ops, the
   project site. One association can own many parcels.
 - **Management firm = its own account** (`account_type='management_company'`,
-  anchor key `dbpr_cab_license`), linked to each association it manages with a
-  relationship row (role `manages`, `source`, `as_of`). Decided 2026-11-09.
-  Its staff are contacts on the firm account, not on the association.
+  anchor key `dbpr_cab_license`). Decided 2026-11-09. Its staff are contacts on
+  the firm account, not on the association.
+- **Firm ↔ property link** is on the location, for HOAs and condos alike:
+  new column `core.location.management_account_id` → `core.account`. This
+  mirrors the CRM, where `properties.management_company_id` (and
+  `hoa_properties.management_company_id`) points to `management_companies.id`,
+  so the cutover maps it column to column. Texas can fill it too, from the TREC
+  certificate's management company (migration 019).
 - **Contacts** = officers and registered agent from F1; managers from F5;
   phone/website from F9.
 - `size_metric` = units (F2/F3) where known, otherwise common-area acres
@@ -181,12 +192,16 @@ Both are tested against a labeled sample before trusting them.
 
 Migrations continue at `021_`. Names are proposals.
 
+| Migration | Change | For |
+|---|---|---|
+| 021 | `ALTER TABLE core.location ADD management_account_id bigint REFERENCES core.account` + index | §3 firm ↔ property link (TX and FL) |
+
 | Migration | Table | Source |
 |---|---|---|
-| 021 | `staging.fl_sunbiz_assoc` (filtered to association candidates; keep raw officer block as jsonb) | F1 |
-| 022 | `staging.fl_dbpr_condo_coop` (one table, `program` column `condo`/`coop`) | F2, F3 |
-| 023 | `staging.fl_dbpr_cam` (firms and individuals, `license_kind` column) | F4, F5 |
-| 024 | `staging.fl_common_area_parcel` | F6 (+ F7 geometry) |
+| 022 | `staging.fl_sunbiz_assoc` (filtered to association candidates; keep raw officer block as jsonb) | F1 |
+| 023 | `staging.fl_dbpr_condo_coop` (one table, `program` column `condo`/`coop`) | F2, F3 |
+| 024 | `staging.fl_dbpr_cam` (firms and individuals, `license_kind` column) | F4, F5 |
+| 025 | `staging.fl_common_area_parcel` | F6 (+ F7 geometry) |
 
 F8 and F9 reuse existing patterns (`enrich_*` tables) and get their own
 migration only when built.
@@ -199,8 +214,9 @@ Ordered. Each step has a done-when.
 
 **Phase 0 — verify sources (no connector code yet).**
 
-1. **Profile F1.** Pull one quarterly part over SFTP, parse 1,000 records
-   against `cor.html`, count non-profits and regex hits statewide. *Done when*
+1. **Profile F1.** Pull the Hillsborough ZIP buckets from the Sunbiz Daily
+   API, fetch detail for Hunters Green and 50 others, record which fields come
+   back (officers, agent, addresses), count regex hits. *Done when*
    the profile, with fill rates, is written up here.
 2. **Profile F2–F5.** F4/F5 partly done: `lic38cam.csv` (5 MB, 28,907 rows)
    mixes record types `CAB` (firm, 2,070), `CAM` (person, 19,575) and course
@@ -218,7 +234,7 @@ Ordered. Each step has a done-when.
 
 **Phase 1 — load.**
 
-5. Migrations 021–024.
+5. Migrations 021–025.
 6. `connectors/hoa/fl_sunbiz_assoc.py` — fixed-width parser, non-profit +
    name filter, daily-delta support. Tests from a fixture slice.
 7. `connectors/hoa/fl_dbpr_condo_coop.py` and `fl_dbpr_cam.py` — follow
@@ -283,13 +299,16 @@ Sunbiz, the tax roll and the CAM licenses. Aspire is the ground truth. Checked
 | Sub-association | Property 706672 "Wynstone @ Hunters Green", managed by New Tampa Property Management | F7 `WYNSTONE NEIGHBORHOOD ASSOC IN`, `C/O NEW TAMPA PROPERTY MANAGEMENT`; F4 CAB2519 | Match. Public also finds Parcel 3, 6, 7, 10 neighborhood associations Aspire does not have (managers incl. Unique Property Services CAB3665) |
 | Named managers | 7 contacts; 2 labeled LCAM (Peterson, Finnerty) | F5 current-license file finds 2 of 7 (Chiorando, Lusk); none of the LCAM-labeled ones | People come from CRM, not DBPR |
 | Phone / email | Front desk 813-991-4818, business emails | None in F1/F4/F5/F7 | Needs F9 or CRM |
-| Sunbiz doc number | Not stored | Not checked: web search blocked; comes with F1 SFTP profile | Open |
+| Sunbiz doc number | Not stored | Not checked yet; comes with the F1 API profile | Open |
 
-Aspire data issues this exposes, for workstream A: RealManage exists as two
-companies; RealManage staff are filed under the association instead of the
-firm; the replaced manager is still linked; no geolocation.
+Aspire is messy (here: RealManage as two companies, its staff filed under the
+association, the replaced manager still linked, no geolocation), and duplicates
+are common across the whole dataset. **We do not clean Aspire.** The pipeline
+must expect many Aspire records for one real entity: match each pipeline
+account to all of them and score the pilot on the match, not on Aspire being
+tidy.
 
 Pilot pass criteria: the pipeline produces one master association account
 with the 23 parcels, a parent link from each sub-association, one RealManage
-firm account, the Sunbiz doc number, and a manager relationship that agrees
-with Aspire.
+firm account, the Sunbiz doc number, and `management_account_id` on each
+location pointing at RealManage (Wynstone: New Tampa Property Management).
