@@ -6,7 +6,8 @@
 #   2. TX TREC PDF OCR      (certificate queue from stage 1 → enrich_hoa_pdf_contact)
 #   3. hoa_gmaps_enrich     (Google Places supplemental phone/website/email lookup —
 #                            skips associations stage 2 already found a contact for)
-#   4. core_apply           -> core.*
+#   4. hoa_merge            -> staging.resolved_* (vertical='hoa')
+#   5. core_apply           -> core.*
 #
 # Required env vars:
 #   DATABASE_URL      — libpq connection string; composed below from DB_PASSWORD_SECRET
@@ -45,7 +46,18 @@ fi
 
 export PYTHONPATH="${PYTHONPATH:-/app/connectors}"
 WORK_DIR=$(mktemp -d)
-trap 'rm -rf "${WORK_DIR}"' EXIT
+
+RUN_ID=$(python -m lib.pipeline_run start --source-id hoa_pipeline)
+echo "[hoa] source_run_id=${RUN_ID}" >&2
+
+cleanup() {
+    local exit_code=$?
+    local final_status="failed"
+    [[ "${exit_code}" -eq 0 ]] && final_status="succeeded"
+    python -m lib.pipeline_run finish --run-id "${RUN_ID}" --status "${final_status}" || true
+    rm -rf "${WORK_DIR}"
+}
+trap cleanup EXIT
 
 echo "[hoa] working directory: ${WORK_DIR}" >&2
 
@@ -54,7 +66,7 @@ echo "[hoa] working directory: ${WORK_DIR}" >&2
 #    tx_trec_hoa takes positional file paths (glob-expanded by the script, not
 #    the shell, because the connector calls glob.glob() on each pattern).
 # ---------------------------------------------------------------------------
-echo "[hoa] stage 1/4 — TX TREC HOA" >&2
+echo "[hoa] stage 1/5 — TX TREC HOA" >&2
 : "${HOA_DATA_GLOB:?HOA_DATA_GLOB must be set to glob matching TREC_HOA_Management_Certificates_*.csv}"
 
 ZCTA_ARGS=""
@@ -75,7 +87,7 @@ python -m hoa.tx_trec_hoa \
 #    Queue CSV from stage 1. Scanned certificates — OCR is the primary path.
 #    Cached ok rows (same certificate_id) are skipped inside the connector.
 # ---------------------------------------------------------------------------
-echo "[hoa] stage 2/4 — TX TREC PDF OCR enrich" >&2
+echo "[hoa] stage 2/5 — TX TREC PDF OCR enrich" >&2
 
 PDF_ARGS=(
     --queue "${WORK_DIR}/tx_trec_pdf_queue.csv"
@@ -101,7 +113,7 @@ python -m hoa.tx_trec_pdf_enrich "${PDF_ARGS[@]}"
 #    guess). Places is a fallback for associations OCR came back empty on,
 #    plus a source of `website`, which the certificate often lacks.
 # ---------------------------------------------------------------------------
-echo "[hoa] stage 3/4 — Google Places enrichment" >&2
+echo "[hoa] stage 3/5 — Google Places enrichment" >&2
 : "${GOOGLE_MAPS_API_KEY:?GOOGLE_MAPS_API_KEY must be set (see .env.example)}"
 
 python -m hoa.hoa_gmaps_enrich \
@@ -113,9 +125,15 @@ python -m hoa.hoa_gmaps_enrich \
     --rate-pause "${HOA_GMAPS_RATE_PAUSE:-0.2}"
 
 # ---------------------------------------------------------------------------
-# 4. core_apply -> core.*
+# 4. hoa_merge -> staging.resolved_* (vertical='hoa')
 # ---------------------------------------------------------------------------
-echo "[hoa] stage 4/4 — core_apply" >&2
-python -m lib.core_apply --run-id 0
+echo "[hoa] stage 4/5 — HOA merge" >&2
+python -m hoa.hoa_merge
+
+# ---------------------------------------------------------------------------
+# 5. core_apply -> core.*
+# ---------------------------------------------------------------------------
+echo "[hoa] stage 5/5 — core_apply" >&2
+python -m lib.core_apply --run-id "${RUN_ID}"
 
 echo "[hoa] pipeline complete" >&2

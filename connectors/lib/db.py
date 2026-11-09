@@ -415,12 +415,12 @@ def upsert_boundaries(
         ":source_id",
         ":natural_key",
         *[f":{c}" for c in extra_cols],
-        f"CASE WHEN :geojson IS NULL THEN NULL ELSE {boundary_expr} END",
+        f"CASE WHEN CAST(:geojson AS text) IS NULL THEN NULL ELSE {boundary_expr} END",
     ]
     if area_col:
         insert_cols.append(area_col)
         value_exprs.append(
-            f"CASE WHEN :geojson IS NULL THEN NULL ELSE "
+            f"CASE WHEN CAST(:geojson AS text) IS NULL THEN NULL ELSE "
             f"ST_Area({_GEOJSON_TO_MULTIPOLYGON}::geography) / {SQM_PER_ACRE!r} END"
         )
 
