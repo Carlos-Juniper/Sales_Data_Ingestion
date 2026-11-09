@@ -68,7 +68,7 @@ layout profile like plan §6.2.1 before a connector is written.
 
 | # | Source | Grain | What it contributes | Key | Status |
 |---|---|---|---|---|---|
-| F1 | **Sunbiz corporate filings (Sunbiz Daily API)** | One row per corporation | The association as a legal entity: legal name, status, filing date, principal + mailing address, registered agent, up to 6 officers with titles and addresses | `sunbiz_doc` | Key in `.env`; detail fields to verify (§6 step 1) |
+| F1 | **Sunbiz corporate data files (DOS SFTP bulk)** | One row per corporation | The association as a legal entity: legal name, status, filing date, FEI, principal + mailing address, registered agent, up to 6 officers with titles and addresses | `sunbiz_doc` | Profiled 2026-11-09 (§6 step 1). Sunbiz Daily API is the fallback |
 | F2 | **DBPR condominium extract** | Project rows + managing-entity rows | Condo projects with **unit counts**; managing association with fund revenue/expense | DBPR project no. | Verify |
 | F3 | **DBPR cooperative extract** | Project rows + managing entity | Same as F2 for Ch. 719 co-ops (includes resident-owned manufactured-home communities) | DBPR project no. | Verify |
 | F4 | **DBPR CAM firm licensees** | One row per licensed firm | Management companies — frequently the buyer | CAM firm license no. | Verify |
@@ -80,19 +80,29 @@ layout profile like plan §6.2.1 before a connector is written.
 
 Source locations:
 
-- **F1** — **Sunbiz Daily API** (`www.sunbizdaily.com/api/v1`), which we
+- **F1** — the Division of Corporations' free bulk files on
+  `sftp.floridados.gov` (public guest login, published by DOS). Layout:
+  `dos.sunbiz.org/data-definitions/cor.html`. Profile, file list and counts
+  are in §6 step 1. The file to load is
+  `doc/Quarterly/Non-Profit/npcordata.zip` (43 MB): active non-profits only,
+  all 202k of them, so the HOA filter runs locally with no paging.
+
+  Fallback: the **Sunbiz Daily API** (`www.sunbizdaily.com/api/v1`), which we
   already pay for. Key `SUNBIZ_API_KEY`, header `X-API-Key`. The old repo
   (`juniperlandscaping/juniper-crm-HOA-pipeline`, `scrapers/sunbiz.py`) shows
   how it works:
   - `GET /filings/?filing_type=DOMNP&state=FL&zip=<prefix>` lists active
-    Florida non-profits (~23.8k as of 2026-06). Pages are capped at
-    100 × 100, so the old code splits by ZIP prefix (`32`, `330`–`339`, `34`).
-  - `GET /filings/<corporation_number>/` returns one filing's detail. Phase 0
-    must confirm it carries officers, registered agent and addresses.
+    Florida non-profits. The old repo saw ~23.8k as of 2026-06; the bulk file
+    has 196,741 active `DOMNP`, so the old listing returned about 12% of them
+    (cause unknown: the paging cap or a filter on the API side).
+    Pages are capped at 100 × 100, so the old code splits by ZIP prefix
+    (`32`, `330`–`339`, `34`).
+  - `GET /filings/<corporation_number>/` returns one filing's detail.
   - Rate limit 1,000 req/hr; the old code pauses 7.5 s per request.
 
-  Fallback if the API lacks a field: the state's free SFTP
-  (`sftp.floridados.gov`, fixed-width, layout `dos.sunbiz.org/data-definitions/cor.html`).
+  Use the API only for single-record lookups between quarterly drops (e.g. a
+  new filing's officers before the next quarterly), if at all. Its detail
+  payload has not been profiled: no key was available on 2026-11-09.
 - **F2, F3** — `www2.myfloridalicense.com/condos-timeshares-mobile-homes/public-records/`.
   The page lists column headers per file and a ReadMe. Terminated, rejected and
   withdrawn projects are not included.
@@ -121,7 +131,7 @@ Source locations:
     (`HUNTER'S GREEN COMMUNITY ASSOC`, `HUNTERS GREEN COMMUNITY ASSOCI`,
     `HUNTER'S GREEN COMM ASSOCIATIO`). Match on a normalized prefix.
 - **F1 web search** (`search.sunbiz.org`) sits behind a Cloudflare challenge.
-  Do not scrape it; use the API.
+  Do not scrape it; use the bulk file.
 
 ### 2.2 Sources considered and skipped
 
@@ -168,7 +178,7 @@ Property Management on 8 of 23 Hunters Green parcels).
 
 | Link | Method | Tier (plan §5.1) |
 |---|---|---|
-| F1 → association filter | Non-profit entity type + the §6.2 name regex; exclude `management`, `realty`, `services`, `LLC` | — (filter, ~85–92% precision) |
+| F1 → association filter | Filing type `DOMNP` + the revised name regex in §6 step 1 (the plan §6.2 regex misses `HOMEOWNERS' ASSOCIATION`) | — (filter; Hillsborough sample ~98% precision, ~88% recall proxy) |
 | F2/F3 managing entity → F1 | Exact Sunbiz doc number if the DBPR file carries one (verify); else normalized name + ZIP5 | 1 or 2 |
 | F6 parcel owner → F1 | Normalized `OWN_NAME` vs association name, same county; boost when `OWN_ADDR1` matches F1 mailing/agent address | 2 or 3 |
 | F6 → F7 | `PARCEL_ID` ↔ `PARCELNO` (normalize county formatting) | 1 |
@@ -214,10 +224,109 @@ Ordered. Each step has a done-when.
 
 **Phase 0 — verify sources (no connector code yet).**
 
-1. **Profile F1.** Pull the Hillsborough ZIP buckets from the Sunbiz Daily
-   API, fetch detail for Hunters Green and 50 others, record which fields come
-   back (officers, agent, addresses), count regex hits. *Done when*
-   the profile, with fill rates, is written up here.
+1. ~~**Profile F1.**~~ Bulk files done 2026-11-09. **Decision: the SFTP bulk
+   file is primary; the Sunbiz Daily API is an optional fallback.** The API
+   comparison was not run (no `SUNBIZ_API_KEY` available), and it is not
+   needed to decide: the bulk file already has every field the API was meant
+   to supply (below), costs nothing, has no rate limit, and can be filtered
+   locally. The API listing the old repo used returned ~23.8k non-profits
+   against 196,741 in the bulk file. Profile:
+
+   **Files** (`sftp.floridados.gov`, guest login):
+
+   | Path | Content | Size / rows | Freshness |
+   |---|---|---|---|
+   | `doc/Quarterly/Non-Profit/npcordata.zip` | **Use this.** Active non-profits only. Zip of 10 files `npcordata0.txt`–`9.txt` | 43 MB zip, 291 MB text, 202,308 rows: `DOMNP` 196,741, `FORNP` 5,264, `NPREG` 303. All status `A` | Quarterly. Current drop built 2026-10-06 |
+   | `doc/Quarterly/Cor/cordata.zip` | All entity types, all statuses | 1.79 GB zip | Quarterly. Not needed for HOAs |
+   | `doc/cor/YYYYMMDDc.txt` | Daily file, all entity types | ~2,300 rows/day, ~60 `DOMNP`/day | Daily, Mon–Sat, history back to 2011 |
+   | `doc/cor/Events/YYYYMMDDce.txt` | Daily events, 662-char records (layout in `COREVENTREADME.txt`) | ~1,900 rows/day | Daily |
+
+   - **Record format.** Fixed width, 1,440 characters, latin-1 (476 rows
+     have non-ASCII bytes, so decode latin-1 and do not `grep` the raw file).
+     Quarterly lines end in CRLF. Daily lines end in LF, and the last 4
+     filler bytes are NUL.
+   - **Fields** (all present in every row of the Hillsborough candidate set
+     unless noted): document number, name (192), status (`A`/`I`), filing
+     type, principal address, mailing address, file date (`MMDDYYYY`), FEI
+     (96.8%), last three annual-report years and dates, registered agent
+     name, type (`P` person / `C` company) and address, and up to 6 officers,
+     each with title, type, name, address and ZIP+4. A "more than six
+     officers" flag is set on 4.2%. Person names are split into fixed
+     last/first/middle sub-fields (e.g. `SMITH               JOHN          A`).
+     There is **no county field**, so county comes from ZIP or from the F7
+     parcel link.
+   - **What the daily files are.** 98% of daily `DOMNP` rows are new 2026
+     filings. Officer and agent changes on existing associations arrive only
+     with the next quarterly. The events file carries reinstatements,
+     dissolutions, amendments, name changes and agent changes (with
+     addresses, no officers). So: load the quarterly, add dailies for new
+     associations, and use events to flip status between quarterlies.
+   - **Fill rates**, 2,378 Hillsborough candidates (old regex): at least one
+     officer 99.8% (3 officers is the most common count and the median), officer
+     address 100%, agent 100% (company 58%, person 42%), latest annual report
+     2026 96.8% (the rest are new filings). Principal address is the same as
+     the mailing address on 65.6%; 11.2% have `C/O` in one of them.
+   - **Registered agents point at firms.** The top Hillsborough agents are
+     management firms and HOA law firms: Home Encounter HECM (204 under 3
+     spellings), Appleton Reiss (87), Westcoast Management & Realty (80),
+     Vanguard Management Group (43), Rizzetta & Company (39), Bay Ridge
+     Property Management (27), Bush Ross (26). This supports the §4 agent → F4
+     link, after normalizing the spellings.
+
+   **Counts.** Hillsborough = principal or mailing ZIP in the county's ZIP
+   list (`335xx` Hillsborough ZIPs plus `33601`–`33694`). Border ZIPs such as
+   Lutz and Odessa overlap Pasco, so treat county counts as approximate.
+
+   | Set | Statewide | Hillsborough |
+   |---|---|---|
+   | Active `DOMNP` | 196,741 | 12,857 |
+   | Plan §6.2 regex | 36,677 | 2,378 |
+   | Revised regex (below) | 51,803 | 3,272 |
+   | ZIP 33647 only, plan regex | — | 35 |
+
+   **Revised name regex.** The plan §6.2 regex misses `HOMEOWNERS'
+   ASSOCIATION` (apostrophe after the S), `OWNERS' ASSOCIATION`, `CONDOMINIUM
+   NO. 5 ASSOCIATION` and `TOWNHOUSE ASSOCIATION`. Use:
+
+   ```
+   \bowner'?s?'?\s+assoc | \bowners?'?\s+(of\s+)?assoc | \bhome\s?owner
+   | \bcondo(minium)?s?\b | \bco-?op(erative)?\b.*\bassoc | \bcommunity\s+assoc
+   | \bneighborhood\s+assoc | \bmaster\s+assoc | \b(HOA|POA|COA)\b
+   | \bvillas?\b.*\bassoc | \btownho(me|use)s?\b | residents'?\s+assoc
+   | \bmaintenance\s+assoc | \bproperty\s+owners\b
+   ```
+
+   Exclude `management`, `realty`, `LLC`, `BAR`, `alumni`, `chamber`,
+   `merchants`, `league`, `foundation`, `political`, `teachers`, `nurses`,
+   `physicians`, `contractors`, `reform`, `apartment association`, and
+   `association of florida` / `florida association` / `national
+   association`. Do **not** exclude `club`, `church`, `medical` or `union`:
+   they knock out real condos (`CHURCHILL TOWNHOMES`, `MEMORIAL MEDICAL OFFICE
+   CONDOMINIUM`, `UNION PARK MASTER`). Do not exclude `services` either
+   (`HARBOUR ISLAND COMMUNITY SERVICES ASSOCIATION`).
+
+   - **Precision.** By eye, 59 of 60 random Hillsborough hits were
+     associations (the miss, a temple named `... LIEN HOA`, is now excluded).
+     A second sample of 80 had none wrong; of 30 hits only the revised regex
+     finds, 28 were associations (doubtful: a dock owners' group and
+     `BAYSHORE CONDOMINIUM & COMPANY`). Commercial owners' associations
+     (`PROFESSIONAL PARK OWNERS ASSOCIATION`) count as hits: they own
+     landscaped common area.
+   - **Recall proxy.** 1,340 Hillsborough `DOMNP` have a known management
+     firm or HOA law firm as agent. The revised regex catches 1,177 (88%),
+     the plan regex 860 (64%). The misses are mostly
+     `<subdivision> ASSOCIATION, INC.` and bare `<name>, INC.`
+     (`KIRBY CREEK, INC.`, `ENCORE AT FISHHAWK RANCH ASSOCIATION, INC.`). The
+     two §4 recall rules (agent is a CAM firm, owner of a code-009 parcel)
+     are what recover them.
+   - **Pilot.** Hunters Green is in the file: `N22777` HUNTER'S GREEN
+     COMMUNITY ASSOCIATION, INC., active, filed 1987-10-01, FEI present,
+     principal = mailing = 9456 Highland Oak Drive (matches Aspire and F7),
+     agent Bush Ross Registered Agent Services, 6 officers (more-than-six flag
+     set), 2026 annual report filed. Sub-associations also present:
+     Waterforde (`N95000003989`), Wynstone (`N29548`), Parcel 3 (`N30011`),
+     Fox Chase (`N28381`), Highlands condo (`N03000004881`). The manager
+     (RealManage) is not in the Sunbiz record, so it still comes from F7/F4.
 2. **Profile F2–F5.** F4/F5 partly done: `lic38cam.csv` (5 MB, 28,907 rows)
    mixes record types `CAB` (firm, 2,070), `CAM` (person, 19,575) and course
    providers (`CRSE`, `PROV`, `PRE`), so filter on type. It holds current
@@ -235,8 +344,9 @@ Ordered. Each step has a done-when.
 **Phase 1 — load.**
 
 5. Migrations 021–025.
-6. `connectors/hoa/fl_sunbiz_assoc.py` — fixed-width parser, non-profit +
-   name filter, daily-delta support. Tests from a fixture slice.
+6. `connectors/hoa/fl_sunbiz_assoc.py` — fixed-width parser (latin-1) for
+   `npcordata`, `DOMNP` + revised name filter, daily `c.txt` files for new
+   filings and `ce.txt` events for status changes. Tests from a fixture slice.
 7. `connectors/hoa/fl_dbpr_condo_coop.py` and `fl_dbpr_cam.py` — follow
    `connectors/resort/fl_dbpr_lodging.py` (dedup on the license/project key,
    never sum repeated totals).
@@ -278,6 +388,10 @@ Ordered. Each step has a done-when.
    home addresses. Use them for matching
    only. Do not surface them as contact addresses without a decision on
    outreach policy (CAN-SPAM/TCPA notes in the CRM workstreams plan).
+6. Is the Sunbiz Daily API subscription still worth paying for? The bulk file
+   covers F1. Profile the API's detail payload once the key is available, and
+   keep it only if it adds something the bulk file lacks (e.g. more than six
+   officers, or officer changes between quarterlies).
 
 ---
 
@@ -299,7 +413,7 @@ Sunbiz, the tax roll and the CAM licenses. Aspire is the ground truth. Checked
 | Sub-association | Property 706672 "Wynstone @ Hunters Green", managed by New Tampa Property Management | F7 `WYNSTONE NEIGHBORHOOD ASSOC IN`, `C/O NEW TAMPA PROPERTY MANAGEMENT`; F4 CAB2519 | Match. Public also finds Parcel 3, 6, 7, 10 neighborhood associations Aspire does not have (managers incl. Unique Property Services CAB3665) |
 | Named managers | 7 contacts; 2 labeled LCAM (Peterson, Finnerty) | F5 current-license file finds 2 of 7 (Chiorando, Lusk); none of the LCAM-labeled ones | People come from CRM, not DBPR |
 | Phone / email | Front desk 813-991-4818, business emails | None in F1/F4/F5/F7 | Needs F9 or CRM |
-| Sunbiz doc number | Not stored | Not checked yet; comes with the F1 API profile | Open |
+| Sunbiz doc number | Not stored | F1 `N22777`, active, agent Bush Ross, 6 officers; sub-associations Waterforde, Wynstone, Parcel 3 and Fox Chase also filed | Found in the bulk file |
 
 Aspire is messy (here: RealManage as two companies, its staff filed under the
 association, the replaced manager still linked, no geolocation), and duplicates
