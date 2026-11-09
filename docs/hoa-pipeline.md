@@ -68,7 +68,7 @@ layout profile like plan §6.2.1 before a connector is written.
 
 | # | Source | Grain | What it contributes | Key | Status |
 |---|---|---|---|---|---|
-| F1 | **Sunbiz corporate bulk data** | One row per corporation | The association as a legal entity: legal name, status, filing date, principal + mailing address, registered agent, up to 6 officers with titles and addresses | `sunbiz_doc` | Verify layout (§8 item 3) |
+| F1 | **Sunbiz corporate filings (Sunbiz Daily API)** | One row per corporation | The association as a legal entity: legal name, status, filing date, principal + mailing address, registered agent, up to 6 officers with titles and addresses | `sunbiz_doc` | Key in `.env`; detail fields to verify (§6 step 1) |
 | F2 | **DBPR condominium extract** | Project rows + managing-entity rows | Condo projects with **unit counts**; managing association with fund revenue/expense | DBPR project no. | Verify |
 | F3 | **DBPR cooperative extract** | Project rows + managing entity | Same as F2 for Ch. 719 co-ops (includes resident-owned manufactured-home communities) | DBPR project no. | Verify |
 | F4 | **DBPR CAM firm licensees** | One row per licensed firm | Management companies — frequently the buyer | CAM firm license no. | Verify |
