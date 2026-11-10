@@ -560,6 +560,70 @@ DBPR managing entity carry the firm link.
     agent ↔ CAM firm) from the pilot metro and calibrate the thresholds.
     Uncertain pairs go to `review.match_queue`.
 
+**Phase 1–2 run, 2026-11-10 (local Postgres, not prod).** Loaded F1
+statewide (197,041 rows), F2/F3 (28,739), F4 (21,645) and Hillsborough F7
+code-009 parcels (7,061), then ran `hoa.hoa_fl_merge` and `lib.core_apply`.
+Output: 63,815 accounts, 34,823 locations (6,084 with a parcel boundary),
+275,743 contacts, 3,507 pairs queued for review (906 association, 2,601 firm).
+
+Match rates, Hillsborough scope, before → after this round of fixes:
+
+| Link | Before | After |
+|---|---|---|
+| F1 `C/O` → `CAB` firm (auto) | 88.9% (6,645/7,473) | 90.1% (7,607/8,439) |
+| F7 parcel `C/O` → `CAB` firm | 88.6% | 89.3% |
+| F1 registered agent → `CAB` firm | 32.5% | 33.3% (13,726/41,185) |
+| DBPR managing entity routed to a `CAB` firm | 55.0% | 60.2% |
+| Locations with a management firm | 38.3% | 55.9% |
+| Sub-association → master parent link | — | 1,685 (Hillsborough), 1,902 statewide to 546 masters |
+
+Statewide: DBPR managing entity → F1 77.4% (19,024/24,582); DBPR entity
+routed to a `CAB` firm 80.2%; 44.9% of locations carry a firm (statewide condo
+projects have no parcel `C/O`).
+
+What moved the rates:
+
+- **One-word brands.** `C/O REALMANAGE` (449 F1 lines) was classed as a person
+  and dropped. A `C/O` whose canonical key is an F4 alias, or a "person" whose
+  key is an exact `CAB` license name, now reaches the firm. RealManage went
+  from 1 location to 314; Associa Gulf Coast, FirstService Residential and
+  MyTown also gained 100+ each.
+- **Registered agent as last resort.** A location with no newer source and no
+  parcel `C/O` takes the `CAB` firm that is the association's registered agent
+  (auto links only). Location firm source: parcel `C/O` 1,793, newer source
+  818, registered agent 875, none 2,598.
+- **Sub-association parents.** A name of the form `<base> COMMUNITY / MASTER /
+  UMBRELLA / PROPERTY OWNERS ASSOCIATION` is a master. A sub is
+  `<sub> AT|OF|IN <base> …` or `<base> PARCEL|VILLAGE|NEIGHBORHOOD|PHASE|<n> …`
+  in the same 3-digit ZIP. Generic one-word bases (`LAKES`, `OAKS`, `PARK`…)
+  never qualify; two masters on one base in one ZIP3 leave the sub unlinked.
+  40-row sample: ~95% correct.
+- **Utility owners.** The F7 owner classifier no longer calls subdivisions such
+  as `WATERFORDE …` or `… BAYSWATER …` utilities (0 utility misclassifications
+  after the fix, was 24).
+- **Blank DBPR entity names** take the project name, so they are no longer
+  rejected by `resolved_account.legal_name NOT NULL`.
+
+Traps found on the run:
+
+- **`core_apply` diffs every vertical.** Any `core.account` row missing from
+  `staging.resolved_*` is tombstoned, whatever its vertical. `core_apply
+  --dry-run` now prints the diff for each vertical separately; confirm every
+  non-`hoa` line is zero before a prod apply. The local run inserted
+  `vertical=hoa` rows only.
+- **`hoa_fl_merge` replaces all `vertical='hoa'` resolved rows, Texas
+  included.** Run the Texas merge in the same batch, or scope the delete by
+  state, before a prod apply.
+- **Parents need two applies.** `parent_account_key` resolves only against
+  accounts already in core. Apply 1 inserts; apply 2 sets the 1,902 parents; a
+  third dry run is all zeros (idempotent).
+- **Untyped NULL parameters.** The location insert's `IS NULL` checks on bind
+  parameters failed on condo locations with no boundary
+  (`AmbiguousParameter`); they now `CAST` first.
+- **ArcGIS 504s.** The Hillsborough parcel query times out on large ID chunks.
+  The fetcher retries, and `--ids-file` accepts a saved `returnIdsOnly`
+  response so a rerun skips the ID query.
+
 **Phase 3 — enrich and serve.**
 
 11. Point `hoa_gmaps_enrich.py` at Florida associations that have no CAM firm
@@ -611,7 +675,7 @@ Sunbiz, the tax roll and the CAM licenses. Aspire is the ground truth. Checked
 | Current manager | RealManage (filed twice: companies 356401 and 207797) | F4 `REALMANAGE LLC`, CAB3372, PO Box 803555 Dallas 75380; F7 `C/O REALMANAGE DALLAS 75380` on 3 parcels | Match, one firm account |
 | Previous manager | Wise Property Management (371455), still linked | F4 CAB448; F7 `C/O WISE PROPERTY MANAGEMENT` on 8 parcels (~440 acres) | Both sources stale; newest source wins |
 | Sub-association | Property 706672 "Wynstone @ Hunters Green", managed by New Tampa Property Management | F7 `WYNSTONE NEIGHBORHOOD ASSOC IN`, `C/O NEW TAMPA PROPERTY MANAGEMENT`; F4 CAB2519 | Match. Public also finds Parcel 3, 6, 7, 10 neighborhood associations Aspire does not have (managers incl. Unique Property Services CAB3665) |
-| Named managers | 7 contacts; 2 labeled LCAM (Peterson, Finnerty) | F5 current-license file finds 2 of 7 (Chiorando, Lusk); none of the LCAM-labeled ones | People come from CRM, not DBPR |
+| Named managers | 7 contacts; 2 labeled LCAM | F5 current-license file finds 2 of 7; neither of the LCAM-labeled ones | People come from CRM, not DBPR |
 | Phone / email | Front desk 813-991-4818, business emails | None in F1/F4/F5/F7 | Needs F9 or CRM |
 | Sunbiz doc number | Not stored | F1 `N22777`, active, agent Bush Ross, 6 officers; sub-associations Waterforde, Wynstone, Parcel 3 and Fox Chase also filed | Found in the bulk file |
 
@@ -626,3 +690,20 @@ Pilot pass criteria: the pipeline produces one master association account
 with the 23 parcels, a parent link from each sub-association, one RealManage
 firm account, the Sunbiz doc number, and `management_account_id` on each
 location pointing at RealManage (Wynstone: New Tampa Property Management).
+
+
+**Pilot result, 2026-11-10.**
+
+| Criterion | Result |
+|---|---|
+| One master account with the Sunbiz doc number | Pass: `N22777` |
+| 23 parcels on the master | Partial: 18. The other parcels are under owner spellings that resolve to sub-associations or stay parcel-only |
+| Parent link from each sub-association | Pass for every sub named `… HUNTERS GREEN …`: Parcel 3/6/7/10 neighborhoods, the `PARCEL 10 NEIGH` parcel-only accounts and the Highlands condo all link to `N22777`. Wynstone and Fox Chase do not: their names do not carry the master's |
+| One RealManage firm account | Pass: CAB3372, one account |
+| Master locations managed by RealManage | Partial: 2 of 18 RealManage, 5 Wise, 11 none. The tax-roll `C/O` is mixed and stale, the master has no F1 `C/O`, and its registered agent is a law firm |
+| Wynstone managed by New Tampa PM | Pass: CAB2519 |
+
+Gaps for review with sales: master-to-sub links for subs without the master's
+name (Wynstone, Fox Chase) need the county HOA layer (§2.1 F8) or Aspire; the
+Highlands condo's manager (Aspire: KW Property Management, CAB3320) is not in
+any public source; the stale master manager needs a newer source (F9 or CRM).

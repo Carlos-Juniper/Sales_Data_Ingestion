@@ -196,3 +196,77 @@ def test_recall_rule_2_skips_charities():
     keys = set(res.account["account_key"])
     assert akey("N1") not in keys and akey("N2") in keys
     assert res.stats["f1_firm_agent_excluded"]["not_association_name"] == 1
+
+
+@pytest.mark.parametrize("name,base", [
+    ("TEST'S GREEN COMMUNITY ASSOCIATION, INC.", "TESTS GREEN"),
+    ("TEST RIDGE MASTER ASSOCIATION, INC.", "TEST RIDGE"),
+    ("TEST LAKES PROPERTY OWNERS ASSOCIATION, INC.", "TEST LAKES"),
+    ("VILLAGE COMMUNITY ASSOCIATION, INC.", None),        # generic one-word base
+    ("THE OAKS OWNERS ASSOCIATION, INC.", None),          # "THE" does not make it specific
+    ("TEST GREEN HOMEOWNERS ASSOCIATION, INC.", None),    # an HOA is not a master
+    ("TEST TOWERS CONDOMINIUM ASSOCIATION, INC.", None),
+])
+def test_master_base(name, base):
+    assert m.master_base(name) == base
+
+
+def test_sub_associations_link_to_master_in_same_zip3():
+    sb = [sunbiz("N1", "TEST'S GREEN COMMUNITY ASSOCIATION, INC.", zip_="33647"),
+          sunbiz("N2", "TEST'S GREEN PARCEL 3 NEIGHBORHOOD ASSOCIATION, INC.", zip_="33624"),
+          sunbiz("N3", "WATERFORDE AT TEST'S GREEN HOMEOWNERS ASSOCIATION, INC.", zip_="33647"),
+          sunbiz("N4", "PARKSIDE VILLAGE OF TESTS GREEN HOMEOWNERS ASSOCIATION, INC.", zip_="33637"),
+          # Same name on another coast: no shared ZIP3, no link.
+          sunbiz("N5", "TEST'S GREEN PARCEL 9 HOMEOWNERS ASSOCIATION, INC.", zip_="32780"),
+          # Base mentioned but not as a sub (no AT/OF/IN, no PARCEL-style marker).
+          sunbiz("N6", "TEST'S GREENWAY HOMEOWNERS ASSOCIATION, INC.", zip_="33647")]
+    res = m.resolve(*frames(sb, [], [FIRM], []))
+    acct = res.account.set_index("account_key")["parent_account_key"]
+    for doc in ("N2", "N3", "N4"):
+        assert acct[akey(doc)] == akey("N1")
+    for doc in ("N1", "N5", "N6"):
+        assert pd.isna(acct[akey(doc)])
+    assert res.stats["sub_association_parent"]["linked"] == 3
+    assert res.stats["sub_association_parent"]["no_zip_master"] == 1
+
+
+def test_two_masters_in_one_zip3_leave_sub_unlinked():
+    sb = [sunbiz("N1", "TEST GREEN COMMUNITY ASSOCIATION, INC."),
+          sunbiz("N2", "TEST GREEN MASTER ASSOCIATION, INC."),
+          sunbiz("N3", "TEST GREEN PARCEL 3 HOMEOWNERS ASSOCIATION, INC.")]
+    res = m.resolve(*frames(sb, [], [FIRM], []))
+    assert res.account["parent_account_key"].isna().all()
+    assert res.stats["sub_association_parent"]["ambiguous"] == 1
+
+
+def test_one_word_brand_care_of_reaches_its_license():
+    brand = firm("CAB7", "TESTBRAND LLC", zip_="75380")  # out-of-state head office
+    sb = [sunbiz("N1", "TEST LAKES HOMEOWNERS ASSOCIATION, INC.", care_of="TESTBRAND"),
+          sunbiz("N2", "TEST HILLS HOMEOWNERS ASSOCIATION, INC.", care_of="PERSON THREE")]
+    res = m.resolve(*frames(sb, [], [FIRM, brand], []))
+    idx = m.FirmIndex.build([("CAB7", "TESTBRAND LLC", "", "75380")])
+    assert m._firm_link(idx, "TESTBRAND", "33647").target == "CAB7"
+    assert m._firm_link(idx, "PERSON THREE", "33647").method == "not_firm"
+    assert res.stats["f1_care_of_to_cab"]
+
+
+def test_registered_agent_firm_is_last_resort_manager():
+    ra = {"name": "TEST PROPERTY MANAGEMENT, INC.", "kind": "C", "zip": "33602"}
+    other = firm("CAB2", "OTHER TEST MANAGEMENT, INC.")
+    sb = [sunbiz("N1", "TEST LAKES HOMEOWNERS ASSOCIATION, INC.", ra=ra),
+          sunbiz("N2", "TEST HILLS HOMEOWNERS ASSOCIATION, INC.", ra=ra)]
+    pc = [parcel("39:A", "TEST LAKES HOMEOWNERS ASSOCIAT", "association"),
+          parcel("39:B", "TEST HILLS HOMEOWNERS ASSOCIAT", "association",
+                 care_of="OTHER TEST MANAGEMENT")]
+    res = m.resolve(*frames(sb, [], [FIRM, other], pc))
+    loc = res.location.set_index("location_name")["management_account_key"]
+    assert loc["TEST LAKES HOMEOWNERS ASSOCIAT"] == fkey("CAB1")   # agent fills the gap
+    assert loc["TEST HILLS HOMEOWNERS ASSOCIAT"] == fkey("CAB2")   # the tax-roll C/O wins
+    assert res.stats["location_firm_from"] == {"f1_agent": 1, "parcel_care_of": 1}
+
+
+def test_unnamed_managing_entity_takes_project_name():
+    pr = [project("condo:9", "TEST HARBOR", "ME7", None, units=10)]
+    res = m.resolve(*frames([], pr, [FIRM], []))
+    k = compute_account_key({"dbpr_managing_entity": "ME7"}, priority=m.ASSOC_PRIORITY)
+    assert res.account.set_index("account_key").loc[k, "legal_name"] == "TEST HARBOR"

@@ -85,7 +85,7 @@ _LOCATION_SQL = text("""
         :location_key, :account_key, :vertical, :location_name,
         CAST(:site_address AS jsonb),
         CASE
-            WHEN :_latitude IS NOT NULL AND :_longitude IS NOT NULL
+            WHEN CAST(:_latitude AS numeric) IS NOT NULL AND CAST(:_longitude AS numeric) IS NOT NULL
             THEN ST_SetSRID(
                 ST_MakePoint(
                     CAST(:_longitude AS numeric)::double precision,
@@ -94,7 +94,7 @@ _LOCATION_SQL = text("""
             ELSE NULL
         END,
         CASE
-            WHEN :_boundary_geojson IS NULL THEN NULL
+            WHEN CAST(:_boundary_geojson AS text) IS NULL THEN NULL
             ELSE ST_Multi(ST_CollectionExtract(
                 ST_MakeValid(ST_GeomFromGeoJSON(CAST(:_boundary_geojson AS text))), 3))
         END,

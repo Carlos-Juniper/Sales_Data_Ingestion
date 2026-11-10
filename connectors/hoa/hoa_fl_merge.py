@@ -23,7 +23,8 @@ Pipeline
    and one per CAB firm (key dbpr_cab_license).
 6. Locations: each parcel and each condo/co-op project of a resolved
    association.  management_account_key is the association's newest firm
-   (DBPR route, weekly > F1 annual report > tax-roll C/O), else the parcel's own.
+   (DBPR route, weekly > F1 annual report > tax-roll C/O), else the parcel's own,
+   else a CAB firm serving as the association's registered agent.
 7. Contacts: F1 officers and registered agent on the association account.
 8. Review-band pairs -> review.pending_pairs.  They are NOT linked here: the
    entity stays on its own account until a reviewer approves the pair.
@@ -95,6 +96,67 @@ FIRM_ALIASES = {
 }
 SQFT_PER_ACRE = 43560.0
 
+# Sub-association -> master.  A master names itself "<BASE> COMMUNITY
+# ASSOCIATION" (or MASTER / UMBRELLA / [PROPERTY] OWNERS); a sub carries the
+# base after AT / OF / IN, or leads with it before a PARCEL / VILLAGE / ...
+# marker.  Both must share a ZIP3, which keeps "X AT WESTCHASE" from finding a
+# Westchase on the other coast.
+_MASTER = re.compile(r"^(?P<base>.+?) (MASTER )?(COMMUNITY|UMBRELLA|PROPERTY OWNERS|OWNERS|MASTER)"
+                     r"( HOMEOWNERS| PROPERTY OWNERS)? (ASSOCIATION|ASSN|ASSOC)$")
+_SUB_LEAD = r"(PARCEL|VILLAGE|NEIGHBORHOOD|SECTION|PHASE|UNIT|TRACT|POD|AREA|NO|NUMBER|\d+)\b"
+_GENERIC_BASE = frozenset({"VILLAGE", "VILLAGES", "VILLAS", "COUNTRY", "ESTATES", "LAKES", "GARDENS",
+                           "PALMS", "OAKS", "POINTE", "HARBOR", "ISLAND", "PLACE", "CLUB", "PARK"})
+
+
+def _parent_clean(name: Optional[str]) -> str:
+    s = (name or "").upper().replace("'", "").replace("@", " AT ").replace("&", " AND ")
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    s = re.sub(r"\b(INC|INCORPORATED|CORP|LLC)\b", " ", s)
+    return " ".join(s.split())
+
+
+def master_base(name: Optional[str]) -> Optional[str]:
+    """"HUNTER'S GREEN COMMUNITY ASSOCIATION, INC." -> "HUNTERS GREEN"."""
+    m = _MASTER.match(_parent_clean(name))
+    if not m:
+        return None
+    base = re.sub(r"^THE ", "", m.group("base"))
+    if " " not in base and (len(base) < 6 or base in _GENERIC_BASE):
+        return None
+    return base
+
+
+def sub_association_parents(accounts: dict[str, tuple[str, set[str]]]
+                            ) -> tuple[dict[str, str], Counter]:
+    """{account_key: (name, zip5s)} -> {child_key: master_key}, outcome counts."""
+    masters: dict[str, list[tuple[str, set[str]]]] = defaultdict(list)
+    for k, (name, zips) in accounts.items():
+        b = master_base(name)
+        if b:
+            masters[b].append((k, {z[:3] for z in zips}))
+    parent: dict[str, str] = {}
+    stats: Counter = Counter()
+    for k, (name, zips) in accounts.items():
+        n = _parent_clean(name)
+        if master_base(name):
+            continue
+        toks = n.split()
+        bases = {" ".join(toks[i:j]) for i in range(len(toks))
+                 for j in range(i + 1, min(i + 6, len(toks)) + 1)} & masters.keys()
+        bases = {b for b in bases
+                 if re.search(rf"\b(AT|OF|IN) {re.escape(b)}\b", n)
+                 or re.match(rf"{re.escape(b)} {_SUB_LEAD}", n)}
+        if not bases:
+            continue
+        z3 = {z[:3] for z in zips}
+        cands = {m for b in bases for m, mz in masters[b] if m != k and mz & z3}
+        if len(cands) == 1:
+            parent[k] = cands.pop()
+            stats["linked"] += 1
+        else:
+            stats["no_zip_master" if not cands else "ambiguous"] += 1
+    return parent, stats
+
 ASSOC_PRIORITY = ("sunbiz_doc", "dbpr_managing_entity")
 FIRM_PRIORITY = ("dbpr_cab_license",)
 
@@ -161,9 +223,16 @@ class Resolution:
 
 
 def _firm_link(idx: FirmIndex, text: Optional[str], zip5: Optional[str]) -> Link:
-    """C/O or agent text -> CAB license, firm-like text only."""
-    if not text or (care_of_kind(text) != "firm"
-                    and firm_key(firm_canon(text)) not in idx.aliases):
+    """C/O or agent text -> CAB license, firm-like text only.
+
+    A one-word brand ("REALMANAGE", "FIRSTSERVICE RESIDENTIAL") has no firm
+    word and reads as a person, so it counts as a firm only when it is a
+    licensee name or DBA exactly.
+    """
+    if not text:
+        return Link(None, "not_firm")
+    kind, key = care_of_kind(text), firm_key(firm_canon(text))
+    if not (kind == "firm" or key in idx.aliases or (kind == "person" and key in idx.by_key)):
         return Link(None, "not_firm")
     m = idx.lookup(text, zip5 or "")
     return Link(m.doc, m.method, m.score or 1.0)
@@ -252,6 +321,7 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
 
     # -- F1 firm signals: agent and C/O -> CAB
     f1_firm: dict[str, Link] = {}
+    f1_agent: dict[str, str] = {}  # doc -> CAB license serving as registered agent
     f1_agent_firm: set[str] = set()
     for d, r in sb.items():
         a = r.attrs
@@ -268,6 +338,8 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
                 queue(STRATEGY_FIRM, SUNBIZ, d, CAM, link.target, link)
         if co.target and co.method not in FIRM_REVIEW_METHODS:
             f1_firm[d] = co
+        if agent.target and agent.method not in FIRM_REVIEW_METHODS:
+            f1_agent[d] = agent.target
         if any(lk.target and lk.method not in FIRM_REVIEW_METHODS for lk in (co, agent)):
             if r.segment != "association_name" and NOT_ASSOCIATION.search((r.name_raw or "").upper()):
                 stats["f1_firm_agent_excluded"]["not_association_name"] += 1
@@ -293,6 +365,8 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
     # -- accounts
     accounts: dict[str, dict] = {}
     assoc_firm: dict[str, Link] = {}
+    agent_firm: dict[str, str] = {}  # last resort: the CAB firm is the registered agent
+    acct_zips: dict[str, set[str]] = defaultdict(set)
 
     def add_account(row: dict) -> str:
         k = row["account_key"]
@@ -314,6 +388,10 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
             })
             if d in f1_firm:
                 assoc_firm.setdefault(k, Link(f1_firm[d].target, "f1_care_of"))
+            if d in f1_agent:
+                agent_firm.setdefault(k, f1_agent[d])
+            acct_zips[k] |= {z for z in (_zip5((a.get(x) or {}).get("zip"))
+                                         for x in ("principal", "mailing")) if z}
         return k
 
     for d in why:
@@ -326,11 +404,13 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
             k = f1_account(lk.target)
         else:
             me = e["me"]
+            # A few DBPR rows leave the entity name blank; the project names it.
+            name = (me.get("name") or "").strip() or e["projects"][0].name_raw
             k = add_account({
                 "account_key": compute_account_key({"dbpr_managing_entity": num},
                                                    priority=ASSOC_PRIORITY),
-                "account_type": "association", "legal_name": me.get("name"),
-                "name_normalized": normalize_name(me.get("name") or ""),
+                "account_type": "association", "legal_name": name,
+                "name_normalized": normalize_name(name or ""),
                 "mailing_address": {x: me[x] for x in ("street", "city", "state", "zip") if me.get(x)},
                 "status": "active", "_ext": {}, "_units": {}, "_sqft": 0.0,
                 "confidence": CONFIDENCE["dbpr_only"],
@@ -341,6 +421,7 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
             acct["_ext"]["dbpr_managing_entity"].append(num)
         for p in e["projects"]:
             acct["_units"][p.natural_key] = p.size_value
+            acct_zips[k] |= {z for z in [_zip5(p.zip5)] if z}
         entity_account[num] = k
         route = (e["projects"][0].attrs or {}).get("care_of")
         fl = _firm_link(fidx, route, _zip5(e["me"].get("zip")))
@@ -390,6 +471,8 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
             a = p.attrs
             if k:
                 accounts[k]["_sqft"] += float(p.size_value or 0)
+                acct_zips[k] |= {z for z in (_zip5(p.zip5), _zip5((a.get("owner") or {}).get("zip")))
+                                 if z}
             fl = _firm_link(fidx, a.get("care_of"), _zip5((a.get("owner") or {}).get("zip")))
             stats["parcel_care_of_to_cab"][fl.method] += 1
             if not k:
@@ -398,7 +481,9 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
                 queue(STRATEGY_FIRM, PARCEL, p.natural_key, CAM, fl.target, fl)
             own_firm = fl.target if fl.target and fl.method not in FIRM_REVIEW_METHODS else None
             best = assoc_firm.get(k)
-            lic = best.target if best else own_firm
+            lic = best.target if best else own_firm or agent_firm.get(k)
+            stats["location_firm_from"]["newer_source" if best else "parcel_care_of" if own_firm
+                                        else "f1_agent" if lic else "none"] += 1
             if best and own_firm and own_firm != best.target:
                 stats["parcel_firm_vs_newer_source"]["disagree"] += 1
             elif best and own_firm:
@@ -422,7 +507,7 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
             })
     for num, e in entities.items():
         k = entity_account[num]
-        lic = (assoc_firm.get(k) or Link(None, "")).target
+        lic = (assoc_firm.get(k) or Link(None, "")).target or agent_firm.get(k)
         for p in e["projects"]:
             locs.append({
                 "location_key": compute_location_key(
@@ -458,6 +543,11 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
                 "source_id": SUNBIZ, "is_current": True,
             })
 
+    # -- sub-association -> master
+    parent, stats["sub_association_parent"] = sub_association_parents(
+        {k: (a["legal_name"], acct_zips[k]) for k, a in accounts.items()
+         if a["account_type"] == "association"})
+
     # -- finish account rows
     rows = []
     for k, acct in accounts.items():
@@ -474,7 +564,7 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
         rows.append({
             "account_key": k, "vertical": VERTICAL, "account_type": acct["account_type"],
             "legal_name": acct["legal_name"], "name_normalized": acct["name_normalized"],
-            "dba_name": acct.get("dba_name"), "parent_account_key": None,
+            "dba_name": acct.get("dba_name"), "parent_account_key": parent.get(k),
             "mailing_address": _jdump(acct.get("mailing_address")), "phone": None, "email": None,
             "website": None, "status": acct["status"], "external_keys": _jdump(ext),
             "size_metric": size, "size_metric_unit": unit, "confidence": acct["confidence"],
@@ -511,7 +601,7 @@ def print_summary(res: Resolution) -> None:
     print(f"  contacts {len(res.contact):,}   review pairs {len(res.review_pairs):,}", file=sys.stderr)
     for name, c in sorted(res.stats.items()):
         ok = FIRM_AUTO_METHODS if "cab" in name else AUTO_METHODS
-        rate = "" if name.startswith(("f1_association", "parcel_firm")) else f"  auto {_rate(c, ok)}"
+        rate = "" if name.startswith(("f1_association", "parcel_firm", "sub_association", "location_firm")) else f"  auto {_rate(c, ok)}"
         print(f"  {name}:{rate}  {dict(c.most_common())}", file=sys.stderr)
 
 

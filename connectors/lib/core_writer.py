@@ -16,6 +16,7 @@ core.location, core.contact, and core.source_record.  It implements:
 Public API
 ----------
   dry_run_diff(engine)             → DiffCounts  (no writes)
+  dry_run_by_vertical(engine)      → {vertical: DiffCounts}  (no writes)
   apply_core_diff(engine, run_id)  → DiffCounts  (transactional write)
   upsert_source_records(engine, records, run_id)
                                    → (inserted, bumped) counts
@@ -211,6 +212,61 @@ def dry_run_diff(engine: Engine) -> DiffCounts:
 
 def _build_dry_run_sql() -> str:
     """Build the dry-run COUNT query — identical CTEs to apply but no DML."""
+    return _diff_ctes() + """
+SELECT
+    (SELECT count(*) FROM acct_new)       AS account_inserts,
+    (SELECT count(*) FROM acct_changed)   AS account_updates,
+    (SELECT count(*) FROM acct_gone)      AS account_tombstones,
+    (SELECT count(*) FROM loc_new)        AS location_inserts,
+    (SELECT count(*) FROM loc_changed)    AS location_updates,
+    (SELECT count(*) FROM loc_gone)       AS location_tombstones,
+    (SELECT count(*) FROM cont_new)       AS contact_inserts,
+    (SELECT count(*) FROM cont_changed)   AS contact_updates,
+    (SELECT count(*) FROM cont_gone)      AS contact_tombstones
+"""
+
+
+# Each diff arm tagged with its vertical: resolved_* for new/changed rows,
+# the owning core.account for gone ones (core.location/contact carry none).
+_BY_VERTICAL_SELECT = """
+, arms(vertical, arm) AS (
+    SELECT ra.vertical, 'account_inserts' FROM acct_new x
+        JOIN staging.resolved_account ra USING (account_key)
+    UNION ALL SELECT ra.vertical, 'account_updates' FROM acct_changed x
+        JOIN staging.resolved_account ra USING (account_key)
+    UNION ALL SELECT ca.vertical, 'account_tombstones' FROM acct_gone x
+        JOIN core.account ca USING (account_key)
+    UNION ALL SELECT rl.vertical, 'location_inserts' FROM loc_new x
+        JOIN staging.resolved_location rl USING (location_key)
+    UNION ALL SELECT rl.vertical, 'location_updates' FROM loc_changed x
+        JOIN staging.resolved_location rl USING (location_key)
+    UNION ALL SELECT ca.vertical, 'location_tombstones' FROM loc_gone x
+        JOIN core.location cl USING (location_key)
+        LEFT JOIN core.account ca ON ca.account_id = cl.account_id
+    UNION ALL SELECT rc.vertical, 'contact_inserts' FROM cont_new x
+        JOIN staging.resolved_contact rc USING (contact_key)
+    UNION ALL SELECT rc.vertical, 'contact_updates' FROM cont_changed x
+        JOIN staging.resolved_contact rc USING (contact_key)
+    UNION ALL SELECT ca.vertical, 'contact_tombstones' FROM cont_gone x
+        JOIN core.contact cc USING (contact_key)
+        JOIN core.account ca ON ca.account_id = cc.account_id
+)
+SELECT coalesce(vertical, '?'), arm, count(*) FROM arms GROUP BY 1, 2
+"""
+
+
+def dry_run_by_vertical(engine: Engine) -> dict[str, DiffCounts]:
+    """dry_run_diff split by vertical — the check that an apply for one
+    vertical changes nothing in another."""
+    out: dict[str, DiffCounts] = {}
+    with engine.connect() as conn:
+        for vertical, arm, n in conn.execute(text(_diff_ctes() + _BY_VERTICAL_SELECT)):
+            setattr(out.setdefault(vertical, DiffCounts()), arm, n)
+    return out
+
+
+def _diff_ctes() -> str:
+    """The WITH clause shared by the dry-run queries: one CTE per diff arm."""
     return f"""
 WITH
 -- ---------------------------------------------------------------
@@ -305,16 +361,6 @@ cont_gone AS (
       AND cc.contact_key IS NOT NULL
       AND cc.is_current = true
 )
-SELECT
-    (SELECT count(*) FROM acct_new)       AS account_inserts,
-    (SELECT count(*) FROM acct_changed)   AS account_updates,
-    (SELECT count(*) FROM acct_gone)      AS account_tombstones,
-    (SELECT count(*) FROM loc_new)        AS location_inserts,
-    (SELECT count(*) FROM loc_changed)    AS location_updates,
-    (SELECT count(*) FROM loc_gone)       AS location_tombstones,
-    (SELECT count(*) FROM cont_new)       AS contact_inserts,
-    (SELECT count(*) FROM cont_changed)   AS contact_updates,
-    (SELECT count(*) FROM cont_gone)      AS contact_tombstones
 """
 
 

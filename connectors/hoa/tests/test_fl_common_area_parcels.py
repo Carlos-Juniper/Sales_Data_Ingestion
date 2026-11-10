@@ -35,6 +35,9 @@ def feature(pid="P1", owner="TEST LAKES HOMEOWNERS ASSOCIAT", addr1="C/O TEST PR
     ("TEST LAND TRUST", "company"),
     ("HILLSBOROUGH COUNTY", "government"),
     ("TAMPA ELECTRIC CO", "utility"),
+    ("TEST WATER WORKS", "utility"),
+    ("WATERFORDE AT TEST GREEN N", "other"),           # a subdivision, not a utility
+    ("TEST BAYSWATER CLOSE", "other"),
     ("TEST BUILDERS INC", "company"),
     ("TEST CREEK", "other"),
     ("", "other"),
