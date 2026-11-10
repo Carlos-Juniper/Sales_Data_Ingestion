@@ -176,6 +176,19 @@ def test_parse_care_of(fields, expected):
     ("MEADOW POINTE COMMUNITY DEVELOPMENT DISTRICT", "district"),
     ("JOHN Q PUBLIC", "person"),
     ("PROPERTY MANAGEMENT", "generic"),
+    # A firm that manages associations is still a firm.
+    ("SCHOO ASSOCIATION MANAGEMENT", "firm"),
+    ("PREMIER ASSN MGMT & CONSULTING", "firm"),
+    ("TESTER & SAMPLE, P.A.", "legal"),
+    ("TESTER SAMPLE LLP", "legal"),
+    ("COGENCY GLOBAL INC.", "legal"),
+    ("TESTER, P.A.", "firm"),                       # lone surname: a licensed manager
+    ("TESTER & ASSOCIATES, PLLC", "firm"),
+    ("TEST COMMUNITY ASSOCIATION & PROPERTY MANAGEMENT INC", "firm"),
+    ("TEST CONDO SERVICES INC", "firm"),
+    # ... unless an association word is left over.
+    ("TEST LAKES HOMEOWNERS ASSOCIATION MANAGEMENT", "association"),
+    ("TEST TOWERS CONDOMINIUM ASSOCIATION", "association"),
 ])
 def test_care_of_kind(name, kind):
     assert care_of_kind(name) == kind
@@ -197,6 +210,11 @@ FIRM_ROWS = [
     ("CAB0011", "SENTRY MANAGEMENT INC", None, "33610"),
     ("CAB0012", "WISE PROPERTY MANAGEMENT LLC", "WISE MGMT; HOMETOWN CAM", "33619"),
     ("CAB0013", "MERIDIAN MANAGEMENT GROUP INC", None, "33647"),
+    # A DBA that firm_canon cannot tell from another licensee's own name.
+    ("CAB0014", "PREMIER ASSOCIATION MANAGEMENT LLC", None, "32746"),
+    ("CAB0015", "ON CALL MANAGEMENT LLC", "PREMIER ASSOCIATION MANAGEMENT; PREMIER MANAGEMENT", "33066"),
+    ("CAB0016", "GULF COAST ASSOCIATION MANAGEMENT LLC", None, "34209"),
+    ("CAB0017", "TEST HOLDINGS INC", "GULF COAST MANAGEMENT", "33704"),
 ]
 
 
@@ -283,3 +301,31 @@ def test_alias():
     idx = FirmIndex.build(FIRM_ROWS, aliases={"ACME HOA PROS": "CAB0010"})
     m = idx.lookup("ACME HOA PROS LLC", "")
     assert (m.doc, m.method, m.auto) == ("CAB0010", "alias", True)
+
+
+def test_full_name_breaks_shared_key(fidx):
+    # PREMIER (ASSOCIATION) MGMT is one key for two licenses: the licensee's
+    # own name beats the identical DBA, the bare DBA goes to its holder.
+    m = fidx.lookup("PREMIER ASSOCIATION MANAGEMENT, LLC", "")
+    assert (m.doc, m.method, m.auto) == ("CAB0014", "exact_full", True)
+    assert fidx.lookup("PREMIER MGMT", "").doc == "CAB0015"
+    m = fidx.lookup("GULF COAST ASSN MGMT", "33602")
+    assert (m.doc, m.method) == ("CAB0016", "exact_full")
+    assert fidx.lookup("GULF COAST MANAGEMENT", "").doc == "CAB0017"
+
+
+def test_office_zip_beats_full_spelling(fidx):
+    # The DBA holder's own office ZIP outranks the other licensee's name.
+    assert fidx.lookup("PREMIER ASSOCIATION MANAGEMENT", "33066").doc == "CAB0015"
+
+
+def test_shared_key_with_two_spellings_is_not_a_branch():
+    idx = FirmIndex.build([
+        ("CAB0101", "SEABREEZE COMMUNITY ASSOCIATION MANAGEMENT LLC", None, "34223"),
+        ("CAB0102", "SEA BREEZE COMMUNITY MANAGEMENT SERVICES INC", None, "33410"),
+        ("CAB0103", "SENTRY MANAGEMENT INC", None, "32779"),
+        ("CAB0104", "SENTRY MANAGEMENT INC", None, "33610"),
+    ])
+    assert idx.lookup("SEA BREEZE MANAGEMENT", "32459").method == "ambiguous"
+    m = idx.lookup("SENTRY MANAGEMENT", "32459")
+    assert (m.doc, m.method) == ("CAB0103", "exact_multi_branch")

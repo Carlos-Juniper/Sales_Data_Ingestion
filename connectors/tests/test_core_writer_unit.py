@@ -192,6 +192,12 @@ class TestHashExpressions:
             return {m.group(1) for m in re.finditer(r"\w+\.(\w+)", expr)}
         assert len(field_names(_LOCATION_HASH_EXPR)) == len(field_names(_LOCATION_CORE_HASH_EXPR))
 
+    def test_location_hash_covers_management_firm(self):
+        # A firm change must re-hash the location; NULL keys drop out of
+        # concat_ws so other verticals' hashes do not move.
+        assert "rl.management_account_key" in _LOCATION_HASH_EXPR
+        assert "cm.account_key" in _LOCATION_CORE_HASH_EXPR
+
     def test_contact_hash_fields_match(self):
         import re
         def field_names(expr):

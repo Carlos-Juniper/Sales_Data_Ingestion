@@ -570,6 +570,10 @@ def _join_initials(tokens: list[str]) -> list[str]:
 # master) rather than a management firm.
 _ASSOC_WORDS = re.compile(r"\b(HOMEOWNERS?|HOME OWNERS|OWNERS|CONDO(MINIUM)?S? ASS\w*|ASSOCIATION|ASSN|"
                           r"HOA|POA|COA|CDD|COMMUNITY DEVELOPMENT DISTRICT)\b")
+# "SCHOO ASSOCIATION MANAGEMENT", "RIVER CONDO SERVICES": a firm that manages
+# associations, not one.  Struck out before the association test.
+_ASSOC_MGMT = re.compile(r"\b(ASSOCIATION|ASSN|ASSOC|CONDO(MINIUM)?|HOA)( AND PROPERTY)? "
+                         r"(MANAGEMENT|MGMT|MGT|MANAGERS|SERVICES)\b")
 _FIRM_WORDS = re.compile(r"\b(MGMT|MANAGEMENT|MANAGMENT|MANAGEMNT|MGT|MNGT|PROPERT\w*|LLC|L ?L ?C|INC|CORP|"
                          r"CO|COMPANY|GROUP|REALTY|SERVICES?|ADVISORS?|SOLUTIONS|PARTNERS|"
                          r"ENTERPRISES?|LIFESTYLES?|HOLDINGS|PA|LTD|REAL ESTATE|CAM|ASSOCIATES|"
@@ -579,7 +583,14 @@ _FIRM_WORDS = re.compile(r"\b(MGMT|MANAGEMENT|MANAGMENT|MANAGEMNT|MGT|MNGT|PROPE
 # Law firms and registered-agent services: the usual F1 registered agent,
 # never the management firm.
 _LEGAL_WORDS = re.compile(r"\b(LAW|LAWYERS?|LEGAL|ATTORNEYS?|ESQ|REGISTERED AGENTS?|"
-                          r"CORPORATE AGENTS?|INCORPORATING)\b")
+                          r"CORPORATE AGENTS?|INCORPORATING|CORPORATE CREATIONS|STATUTORY AGENTS?|"
+                          r"COGENCY GLOBAL|NRAI|N R A I|SKRLD|CT CORPORATION)\b")
+# "BECKER AND POLIAKOFF PA": partners' surnames and a professional suffix.  A
+# lone surname + PA is often a licensed manager, so the AND is required, and
+# a firm word ("WHITEMAN AND ASSOCIATES PLLC") keeps it a firm.
+_LAW_FIRM = re.compile(r"\bAND\b.*\b(PA|PL|PLLC|LLP|CHARTERED)$|\bLLP$")
+_LAW_FIRM_NOT = re.compile(r"\b(MGMT|MANAGEMENT|MGT|PROPERT\w*|REALTY|ASSOCIATES|GROUP|"
+                           r"SERVICES?|CAM|REAL ESTATE|CONSULT\w*|ACCOUNTING)\b")
 
 
 def care_of_kind(name: Optional[str]) -> str:
@@ -598,9 +609,9 @@ def care_of_kind(name: Optional[str]) -> str:
     s = _prep(name)
     if re.search(r"\b(CDD|COMMUNITY DEVELOPMENT DISTRICT|DISTRICT MANAGEMENT|DISTRICT MGMT)\b", s):
         return "district"
-    if _LEGAL_WORDS.search(s):
+    if _LEGAL_WORDS.search(s) or (_LAW_FIRM.search(s) and not _LAW_FIRM_NOT.search(s)):
         return "legal"
-    if _ASSOC_WORDS.search(s):
+    if _ASSOC_WORDS.search(_ASSOC_MGMT.sub(" MGMT", s)):
         return "association"
     if not _FIRM_WORDS.search(s):
         return "person"
@@ -612,6 +623,31 @@ def care_of_kind(name: Optional[str]) -> str:
 def firm_key(canon: str) -> str:
     """Space-free key so split and joined spellings collide."""
     return canon.replace(" ", "")
+
+
+_FULL_DROP: frozenset[str] = frozenset({
+    "INC", "INCORPORATED", "LLC", "L", "C", "LC", "PLLC", "PA", "CORP", "CORPORATION",
+    "CO", "COMPANY", "LTD", "LP", "LLP", "THE", "OF", "AND", "A",
+})
+_FULL_MAP: dict[str, str] = {"ASSN": "ASSOCIATION", "ASSOC": "ASSOCIATION", "ASSC": "ASSOCIATION",
+                             "SERVICE": "SERVICES", "SVCS": "SERVICES", "SVC": "SERVICES",
+                             "SVS": "SERVICES", "SRV": "SERVICES"}
+
+
+def _firm_full(name: Optional[str]) -> str:
+    """Firm name with only legal suffixes dropped.
+
+    firm_canon drops ASSOCIATION, so "PREMIER ASSOCIATION MANAGEMENT" and a
+    DBA "PREMIER MANAGEMENT" share a key; this spelling tells them apart.
+    """
+    out = []
+    for t in _prep(name).split():
+        t = _FULL_MAP.get(t, t)
+        if t not in ("ASSOCIATION", "SERVICES"):
+            t = _FIRM_MAP.get(t, t)
+        if t and t not in _FULL_DROP:
+            out.append(t)
+    return "".join(out)
 
 
 def firm_distinct(canon: str) -> str:
@@ -628,9 +664,11 @@ class FirmRecord:
     canon: str
     key: str
     distinct: str
+    full: str = ""      # _firm_full: ASSOCIATION / COMMUNITY kept
+    dba: bool = False   # a DBA spelling, not the licensee's own name
 
 
-FIRM_AUTO_METHODS = frozenset({"alias", "exact", "firm_fuzzy_zip", "exact_zip", "exact_multi_branch",
+FIRM_AUTO_METHODS = frozenset({"alias", "exact", "exact_full", "distinct_full", "distinct_prefix_full", "firm_fuzzy_zip", "exact_zip", "exact_multi_branch",
                                "distinct", "distinct_zip", "distinct_multi_branch",
                                "distinct_prefix", "distinct_prefix_zip",
                                "distinct_prefix_multi_branch"})
@@ -656,14 +694,15 @@ class FirmIndex:
         brands whose license is under a different legal name.
         """
         idx = cls(aliases={firm_key(firm_canon(k)): v for k, v in (aliases or {}).items()})
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str]] = set()  # (license, full spelling)
         for lic, name, dba, zip_ in rows:
-            for n in [name, *re.split(r"\s*;\s*", dba or "")]:
-                c = firm_canon(n)
-                if not c or (lic, c) in seen:
+            for j, n in enumerate([name, *re.split(r"\s*;\s*", dba or "")]):
+                c, full = firm_canon(n), _firm_full(n)
+                if not c or (lic, full) in seen:
                     continue
-                seen.add((lic, c))
-                rec = FirmRecord(lic, n or "", (zip_ or "")[:5], c, firm_key(c), firm_distinct(c))
+                seen.add((lic, full))
+                rec = FirmRecord(lic, n or "", (zip_ or "")[:5], c, firm_key(c), firm_distinct(c),
+                                 full, j > 0)
                 i = len(idx.variants)
                 idx.variants.append(rec)
                 idx.by_key[rec.key].add(i)
@@ -684,17 +723,18 @@ class FirmIndex:
         if not d:
             return Match(None, "none", 0.0)
         k = firm_key(c)
+        full = _firm_full(name)
         if k in self.aliases:
             return Match(self.aliases[k], "alias")
         hits = self.by_key.get(k)
         if hits:
-            return self._resolve(hits, zip5, "exact")
+            return self._resolve(hits, zip5, "exact", full=full)
         # One distinctive word ("UNITED", "TOWERS") names many firms; the
         # office must then be in the same ZIP area.
         weak = len(d.split()) == 1
         hits = self.by_distinct.get(firm_key(d))
         if hits:
-            return self._resolve(hits, zip5, "distinct", weak)
+            return self._resolve(hits, zip5, "distinct", weak, full)
         # "SENTRY" vs "SENTRY MGMT", "RIZZETTA" vs "RIZZETTA CO": one distinctive
         # part must be a word-prefix of the other.
         dk = firm_key(d)
@@ -708,7 +748,7 @@ class FirmIndex:
             longer = {i for i in pool if len(firm_key(self.variants[i].distinct)) > len(dk)}
             if longer:
                 weak = len(d.split()) == 1
-                return self._resolve(longer, zip5, "distinct_prefix", weak)
+                return self._resolve(longer, zip5, "distinct_prefix", weak, full)
             if pool:
                 m = self._resolve(pool, zip5, "distinct_prefix", weak=True)
                 if m.method.endswith("_zip") and any(
@@ -740,12 +780,15 @@ class FirmIndex:
         return out
 
     def _resolve(self, idxs: Iterable[int], zip5: str, method: str,
-                 weak: bool = False) -> Match:
+                 weak: bool = False, full: str = "") -> Match:
         """Pick one license from *idxs*.
 
         weak: the name evidence alone is not enough, so the firm's office
         must be in the same 3-digit ZIP area as the C/O address; otherwise
         the pair goes to review.
+        full: the query's _firm_full spelling; when the canonical key is shared
+        by several licenses, the one spelled exactly like the query wins, and
+        among those the licensee's own name beats a DBA.
         """
         idxs = set(idxs)
         lics = {self.variants[i].license_no for i in idxs}
@@ -755,6 +798,11 @@ class FirmIndex:
               if zip5 and self.variants[i].zip5[:3] == zip5[:3]}
         if len(z5) == 1:
             return Match(next(iter(z5)), method + "_zip")
+        if full and len(lics) > 1:
+            same = [self.variants[i] for i in idxs if self.variants[i].full == full]
+            for pick in ({r.license_no for r in same}, {r.license_no for r in same if not r.dba}):
+                if len(pick) == 1:
+                    return Match(next(iter(pick)), method + "_full")
         if len(lics) == 1:
             if weak and not z3:
                 return Match(next(iter(lics)), "firm_review", 0.8)
@@ -762,8 +810,10 @@ class FirmIndex:
         if len(z3) == 1:
             return Match(next(iter(z3)), method + "_zip")
         # Several licenses under one brand (branch offices): any one is the
-        # firm, so keep the lowest-numbered as the representative.
-        if not weak and len({self.variants[i].key for i in idxs}) == 1:
+        # firm, so keep the lowest-numbered as the representative.  Branches
+        # carry one spelling; "SEABREEZE COMMUNITY ASSOCIATION MANAGEMENT" and
+        # "SEA BREEZE COMMUNITY MANAGEMENT SERVICES" share a key but are two firms.
+        if not weak and len({self.variants[i].full for i in idxs}) == 1:
             return Match(sorted(lics)[0], method + "_multi_branch", 0.9)
         return Match(None, "ambiguous", 0.0, tuple(sorted(lics)[:10]))
 
