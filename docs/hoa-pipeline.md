@@ -497,6 +497,50 @@ Ordered. Each step has a done-when.
    | Duval, Pinellas, Osceola | none found | none confirmed (Pinellas PA returned 403) |
    | Collier, St. Lucie | unconfirmed (503 / 403) | unconfirmed |
 
+**Matcher calibration — `connectors/hoa/fl_match.py` (done 2026-11-09).**
+Built and tuned before Phase 1 on the real files (Hillsborough F1/F2/F7,
+statewide F2, all 2,070 F4 `CAB` licenses). "Auto" is written without review;
+"+review" adds the pairs queued to `review.match_queue`. Tests:
+`connectors/hoa/tests/test_fl_match.py` (47 cases from the misses below).
+
+| Link | Baseline | Auto | +review | Precision check |
+|---|---|---|---|---|
+| F2/F3 managing entity → F1 (Hillsborough, 599) | 68% name+ZIP, 81% with name-only | 83.0% | 87.5% | 60/60 sampled non-`exact_zip` auto correct. 9 of 10 sampled misses are not in F1 at all (ceiling) |
+| F7 association owner → F1 (Hillsborough, 1,847) | 57% | 83.1% | 88.8% | as above |
+| F7 `C/O` → F4 firm, per parcel (Hillsborough, 3,186 firm-like) | 81.0% (crude `C/O` regex) | 88.1% | 90.5% | 86 sampled non-exact auto: all plausible, 3 borderline (generic-word brands such as `EAST COAST MGMT`) |
+| F7 `C/O` → F4, distinct firm names (106) | 56.0% | 57.5% | 67.0% | misses are mostly firms without a `CAB` license |
+| F2 managing-entity `C/O` → F4 (statewide, 8,747 firm-like) | 78.5% | 78.7% | 84.4% | auto barely moved, but the first pass's false hits (`FIRST …`, `BUSINESS …`) are gone |
+| F1 registered agent → F4 (Hillsborough HOA/condo, 1,074 firm-like agents) | 67.0% | 76.8% | 77.5% | after classing law firms and agent services as `legal` |
+
+What moved the rates:
+
+- **Association names.** Canonical form folds suffixes, glued words
+  (`BREEZEHOMEOWNERS`), `CONDO`/`ASSN` spellings and the 30-character F7 cut
+  (`ASSOCIATI`, `OF HILLSBOROU`). Cascade: exact → prefix (truncated names
+  only) → same core name in a shared ZIP → fuzzy in a shared ZIP (review only).
+  Building and phase designators (`BLDG L`, `NO. 3`) must agree; `, A
+  CONDOMINIUM` is an article, not building A. Condo vs HOA with the same core
+  goes to review. A name-only match is auto only when the F1 address is in the
+  source county or the core name is unique statewide and more than one word;
+  `STONEY CREEK` and the like go to review.
+- **Firm names.** `MANAGEMENT`/`MGT`/`MNGT`… → `MGMT`, legal suffixes dropped,
+  misspelled generic words caught by spell-check (`SEVICES`), initials joined
+  (`A R` → `AR`), singular = plural, a cut tail word dropped (`FLORID`),
+  brands glued (`FIRST SERVICE`, `REAL MANAGE`), every `;`-separated DBA
+  indexed. Generic-only names never match. One distinctive word needs the
+  office in the same 3-digit ZIP; a query longer than the license name
+  (`CAPE CORAL TAX & ACCOUNTING` vs `REALTY ASSOCIATES OF CAPE CORAL`) is
+  review unless the ZIP5 matches; fuzzy is auto only at the licensee's own ZIP.
+- **`C/O` classification.** Each `C/O` is classed as firm, association,
+  district (CDD manager), legal, person or generic, and only firm-like ones are
+  looked up. Person `C/O`s (1,019 of the Hillsborough parcels) need F5/CRM
+  data, not F4.
+
+Remaining misses are coverage, not matching: CDD managers and firms that hold
+no `CAB` license, associations absent from F1, and law-firm registered agents.
+The registered agent is therefore a weak management signal; the `C/O` and the
+DBPR managing entity carry the firm link.
+
 **Phase 1 — load.**
 
 5. Migrations 021–025.
@@ -515,6 +559,131 @@ Ordered. Each step has a done-when.
 10. Hand-label ~300 pairs (association ↔ parcel owner, association ↔ DBPR,
     agent ↔ CAM firm) from the pilot metro and calibrate the thresholds.
     Uncertain pairs go to `review.match_queue`.
+
+**Phase 1–2 run, 2026-11-10 (local Postgres, not prod).** Loaded F1
+statewide (197,041 rows), F2/F3 (28,739), F4 (21,645) and Hillsborough F7
+code-009 parcels (7,061), then ran `hoa.hoa_fl_merge` and `lib.core_apply`.
+Output: 63,815 accounts, 34,823 locations (6,084 with a parcel boundary),
+275,743 contacts, 3,507 pairs queued for review (906 association, 2,601 firm).
+
+Match rates, Hillsborough scope, before → after this round of fixes:
+
+| Link | Before | After |
+|---|---|---|
+| F1 `C/O` → `CAB` firm (auto) | 88.9% (6,645/7,473) | 90.1% (7,607/8,439) |
+| F7 parcel `C/O` → `CAB` firm | 88.6% | 89.3% |
+| F1 registered agent → `CAB` firm | 32.5% | 33.3% (13,726/41,185) |
+| DBPR managing entity routed to a `CAB` firm | 55.0% | 60.2% |
+| Locations with a management firm | 38.3% | 55.9% |
+| Sub-association → master parent link | — | 1,685 (Hillsborough), 1,902 statewide to 546 masters |
+
+Statewide: DBPR managing entity → F1 77.4% (19,024/24,582); DBPR entity
+routed to a `CAB` firm 80.2%; 44.9% of locations carry a firm (statewide condo
+projects have no parcel `C/O`).
+
+What moved the rates:
+
+- **One-word brands.** `C/O REALMANAGE` (449 F1 lines) was classed as a person
+  and dropped. A `C/O` whose canonical key is an F4 alias, or a "person" whose
+  key is an exact `CAB` license name, now reaches the firm. RealManage went
+  from 1 location to 314; Associa Gulf Coast, FirstService Residential and
+  MyTown also gained 100+ each.
+- **Registered agent as last resort.** A location with no newer source and no
+  parcel `C/O` takes the `CAB` firm that is the association's registered agent
+  (auto links only). Location firm source: parcel `C/O` 1,793, newer source
+  818, registered agent 875, none 2,598.
+- **Sub-association parents.** A name of the form `<base> COMMUNITY / MASTER /
+  UMBRELLA / PROPERTY OWNERS ASSOCIATION` is a master. A sub is
+  `<sub> AT|OF|IN <base> …` or `<base> PARCEL|VILLAGE|NEIGHBORHOOD|PHASE|<n> …`
+  in the same 3-digit ZIP. Generic one-word bases (`LAKES`, `OAKS`, `PARK`…)
+  never qualify; two masters on one base in one ZIP3 leave the sub unlinked.
+  40-row sample: ~95% correct.
+- **Utility owners.** The F7 owner classifier no longer calls subdivisions such
+  as `WATERFORDE …` or `… BAYSWATER …` utilities (0 utility misclassifications
+  after the fix, was 24).
+- **Blank DBPR entity names** take the project name, so they are no longer
+  rejected by `resolved_account.legal_name NOT NULL`.
+
+Traps found on the run:
+
+- **`core_apply` diffs every vertical.** Any `core.account` row missing from
+  `staging.resolved_*` is tombstoned, whatever its vertical. `core_apply
+  --dry-run` now prints the diff for each vertical separately; confirm every
+  non-`hoa` line is zero before a prod apply. The local run inserted
+  `vertical=hoa` rows only.
+- **`hoa_fl_merge` replaces all `vertical='hoa'` resolved rows, Texas
+  included.** Run the Texas merge in the same batch, or scope the delete by
+  state, before a prod apply.
+- **Parents need two applies.** `parent_account_key` resolves only against
+  accounts already in core. Apply 1 inserts; apply 2 sets the 1,902 parents; a
+  third dry run is all zeros (idempotent).
+- **Untyped NULL parameters.** The location insert's `IS NULL` checks on bind
+  parameters failed on condo locations with no boundary
+  (`AmbiguousParameter`); they now `CAST` first.
+- **ArcGIS 504s.** The Hillsborough parcel query times out on large ID chunks.
+  The fetcher retries, and `--ids-file` accepts a saved `returnIdsOnly`
+  response so a rerun skips the ID query.
+
+**Miss analysis, 2026-11-10 (Hillsborough).** We sampled the unmatched rows
+of both weak links and sorted them by cause.
+
+| Link | Before | After |
+|---|---|---|
+| Locations with a management firm | 55.9% (3,486 of 6,084 parcels have one) | 66.3% |
+| DBPR managing entity routed to a `CAB` firm | 60.2% | 61.4% (178/290) |
+| DBPR entity with no firm route, firm found by office address | — | 50/327 |
+| F1 `C/O` → `CAB` firm (statewide) | 90.1% | 90.6% |
+
+Location firm source after: parcel `C/O` 1,741, newer source 1,104,
+registered agent 885, office address 409, none 1,945. 58 locations (6
+associations) switched firm: the current F1 report names a different firm
+than the tax roll, and the newer source wins as before.
+
+Parcel misses by cause (2,598 parcels / 953 accounts before the fix):
+
+| Cause | Parcels | Fixable |
+|---|---|---|
+| No `C/O`; registered agent is a person (self-managed) | 775 | no |
+| No `C/O`; registered agent is a law firm or RA service | 620 | no |
+| Parcel-only owner, no `C/O`, no F1 match | 372 | no |
+| Owner mailing address is a `CAB` firm's office (one licensee there) | 340 | **fixed** (address) |
+| All-generic DBA (`C/O CONDOMINIUM ASSOCIATES`) or cut suffix (`… MGT LL`) | 199 | **fixed** |
+| Firm holds no `CAB` license (Continental Group, Rampart, …) | 89 | no |
+| Person / board member `C/O` | 68 | no |
+| Other `C/O` kinds (association, district, legal) | 61 | mostly no |
+| Sub-association whose master has a firm | 27 | follow-up |
+| Review-tier name match | 24 | review queue |
+| `Castle Group` (licensed as Castle Management) | 23 | **fixed** (alias) |
+
+Ceiling: about 1,985 of the 2,598 misses have no licensed firm in any of our
+sources. With the sub-association and review rows resolved, locations top
+out near 68% (we are at 66.3%) without a new source.
+
+DBPR route misses: about 90 are "Sterling Management" in Sun City Center,
+which holds no `CAB` license (the only Sterling licensee is in Cutler Bay); about 13 are
+other unlicensed firms; about 6 are owner/developer LLCs. These are true
+no-matches. The other 309 routes are persons or blank.
+
+What changed:
+
+- **Generic DBA at the holder's ZIP** (`full_zip`). A `C/O` made only of
+  generic words never matched. It now matches when exactly one licensee spells
+  it that way (legal suffixes aside) and has its office at that ZIP.
+- **Cut legal suffix.** A trailing `LL` / `IN` (a 35-character field cut inside
+  `LLC` / `INC`) is dropped before matching.
+- **Office address** (`FirmAddressIndex`, last resort). The F1 mailing
+  address, the DBPR managing-entity address or the parcel owner address
+  matches a `CAB` firm's office when the street and ZIP are equal and only one
+  licensee is there. The street needs a house number or a PO box. Different
+  suites are different offices. The rule is skipped when the `C/O` names a
+  company, since the address then belongs to that company.
+- **Alias** `CASTLE GROUP` → Castle Management LLC.
+
+Precision. Where F1 names a firm, the address rule picks the same firm
+94.8% of the time (5,158/5,439 statewide); several disagreements are sister
+companies. In spot checks, 22 of 25 new location matches showed visible
+evidence for the firm (name, DBA or office address) and none were wrong. All
+20 sampled DBPR address matches and the 7 new DBPR name matches were correct.
 
 **Phase 3 — enrich and serve.**
 
@@ -567,7 +736,7 @@ Sunbiz, the tax roll and the CAM licenses. Aspire is the ground truth. Checked
 | Current manager | RealManage (filed twice: companies 356401 and 207797) | F4 `REALMANAGE LLC`, CAB3372, PO Box 803555 Dallas 75380; F7 `C/O REALMANAGE DALLAS 75380` on 3 parcels | Match, one firm account |
 | Previous manager | Wise Property Management (371455), still linked | F4 CAB448; F7 `C/O WISE PROPERTY MANAGEMENT` on 8 parcels (~440 acres) | Both sources stale; newest source wins |
 | Sub-association | Property 706672 "Wynstone @ Hunters Green", managed by New Tampa Property Management | F7 `WYNSTONE NEIGHBORHOOD ASSOC IN`, `C/O NEW TAMPA PROPERTY MANAGEMENT`; F4 CAB2519 | Match. Public also finds Parcel 3, 6, 7, 10 neighborhood associations Aspire does not have (managers incl. Unique Property Services CAB3665) |
-| Named managers | 7 contacts; 2 labeled LCAM (Peterson, Finnerty) | F5 current-license file finds 2 of 7 (Chiorando, Lusk); none of the LCAM-labeled ones | People come from CRM, not DBPR |
+| Named managers | 7 contacts; 2 labeled LCAM | F5 current-license file finds 2 of 7; neither of the LCAM-labeled ones | People come from CRM, not DBPR |
 | Phone / email | Front desk 813-991-4818, business emails | None in F1/F4/F5/F7 | Needs F9 or CRM |
 | Sunbiz doc number | Not stored | F1 `N22777`, active, agent Bush Ross, 6 officers; sub-associations Waterforde, Wynstone, Parcel 3 and Fox Chase also filed | Found in the bulk file |
 
@@ -582,3 +751,20 @@ Pilot pass criteria: the pipeline produces one master association account
 with the 23 parcels, a parent link from each sub-association, one RealManage
 firm account, the Sunbiz doc number, and `management_account_id` on each
 location pointing at RealManage (Wynstone: New Tampa Property Management).
+
+
+**Pilot result, 2026-11-10.**
+
+| Criterion | Result |
+|---|---|
+| One master account with the Sunbiz doc number | Pass: `N22777` |
+| 23 parcels on the master | Partial: 18. The other parcels are under owner spellings that resolve to sub-associations or stay parcel-only |
+| Parent link from each sub-association | Pass for every sub named `… HUNTERS GREEN …`: Parcel 3/6/7/10 neighborhoods, the `PARCEL 10 NEIGH` parcel-only accounts and the Highlands condo all link to `N22777`. Wynstone and Fox Chase do not: their names do not carry the master's |
+| One RealManage firm account | Pass: CAB3372, one account |
+| Master locations managed by RealManage | Partial: 2 of 18 RealManage, 5 Wise, 11 none. The tax-roll `C/O` is mixed and stale, the master has no F1 `C/O`, and its registered agent is a law firm |
+| Wynstone managed by New Tampa PM | Pass: CAB2519 |
+
+Gaps for review with sales: master-to-sub links for subs without the master's
+name (Wynstone, Fox Chase) need the county HOA layer (§2.1 F8) or Aspire; the
+Highlands condo's manager (Aspire: KW Property Management, CAB3320) is not in
+any public source; the stale master manager needs a newer source (F9 or CRM).

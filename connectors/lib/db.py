@@ -8,6 +8,7 @@ In Cloud Run, inject DATABASE_URL from Secret Manager as an env var.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -251,6 +252,40 @@ def upsert_staging(
         conn.execute(upsert_sql, rows)
 
     logger.info("upsert_staging: wrote %d rows to staging.%s", len(rows), table)
+
+
+def update_staging_attrs(
+    engine: Engine,
+    source_id: str,
+    attrs: dict[str, dict],
+    *,
+    batch_size: int = 5000,
+) -> int:
+    """
+    Set staging.<source_id>.attrs (jsonb) for rows already written by upsert_staging.
+
+    attrs maps natural_key -> a JSON-serialisable dict of the source fields the
+    canonical shape has no column for (FL HOA tables, migrations 022-025).
+    The column is added if missing so a table auto-created by upsert_staging
+    still works.  Returns the number of rows updated.
+    """
+    table = source_id.replace("-", "_")
+    _assert_safe_identifier(table)
+    rows = [{"k": k, "a": json.dumps(v, default=str)} for k, v in attrs.items()]
+    if not rows:
+        return 0
+    sql = text(f"""
+        UPDATE staging.{table} SET attrs = CAST(:a AS jsonb)
+        WHERE source_id = :sid AND natural_key = :k
+    """)
+    n = 0
+    with engine.begin() as conn:
+        conn.execute(text(f"ALTER TABLE staging.{table} ADD COLUMN IF NOT EXISTS attrs jsonb"))
+        for i in range(0, len(rows), batch_size):
+            chunk = [dict(r, sid=source_id) for r in rows[i:i + batch_size]]
+            conn.execute(sql, chunk)
+            n += len(chunk)
+    return n
 
 
 # ---------------------------------------------------------------- internals

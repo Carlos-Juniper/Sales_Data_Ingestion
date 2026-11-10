@@ -16,6 +16,7 @@ core.location, core.contact, and core.source_record.  It implements:
 Public API
 ----------
   dry_run_diff(engine)             → DiffCounts  (no writes)
+  dry_run_by_vertical(engine)      → {vertical: DiffCounts}  (no writes)
   apply_core_diff(engine, run_id)  → DiffCounts  (transactional write)
   upsert_source_records(engine, records, run_id)
                                    → (inserted, bumped) counts
@@ -118,7 +119,8 @@ _LOCATION_HASH_EXPR = """md5(concat_ws('|',
     rl.geometry_source,
     rl.maintained_acres::text,
     rl.acres_confidence,
-    rl.site_type
+    rl.site_type,
+    rl.management_account_key
 ))"""
 
 _CONTACT_HASH_EXPR = """md5(concat_ws('|',
@@ -160,7 +162,8 @@ _LOCATION_CORE_HASH_EXPR = """md5(concat_ws('|',
     cl.geometry_source,
     cl.maintained_acres::text,
     cl.acres_confidence,
-    cl.site_type
+    cl.site_type,
+    cm.account_key
 ))"""
 
 _CONTACT_CORE_HASH_EXPR = """md5(concat_ws('|',
@@ -209,6 +212,61 @@ def dry_run_diff(engine: Engine) -> DiffCounts:
 
 def _build_dry_run_sql() -> str:
     """Build the dry-run COUNT query — identical CTEs to apply but no DML."""
+    return _diff_ctes() + """
+SELECT
+    (SELECT count(*) FROM acct_new)       AS account_inserts,
+    (SELECT count(*) FROM acct_changed)   AS account_updates,
+    (SELECT count(*) FROM acct_gone)      AS account_tombstones,
+    (SELECT count(*) FROM loc_new)        AS location_inserts,
+    (SELECT count(*) FROM loc_changed)    AS location_updates,
+    (SELECT count(*) FROM loc_gone)       AS location_tombstones,
+    (SELECT count(*) FROM cont_new)       AS contact_inserts,
+    (SELECT count(*) FROM cont_changed)   AS contact_updates,
+    (SELECT count(*) FROM cont_gone)      AS contact_tombstones
+"""
+
+
+# Each diff arm tagged with its vertical: resolved_* for new/changed rows,
+# the owning core.account for gone ones (core.location/contact carry none).
+_BY_VERTICAL_SELECT = """
+, arms(vertical, arm) AS (
+    SELECT ra.vertical, 'account_inserts' FROM acct_new x
+        JOIN staging.resolved_account ra USING (account_key)
+    UNION ALL SELECT ra.vertical, 'account_updates' FROM acct_changed x
+        JOIN staging.resolved_account ra USING (account_key)
+    UNION ALL SELECT ca.vertical, 'account_tombstones' FROM acct_gone x
+        JOIN core.account ca USING (account_key)
+    UNION ALL SELECT rl.vertical, 'location_inserts' FROM loc_new x
+        JOIN staging.resolved_location rl USING (location_key)
+    UNION ALL SELECT rl.vertical, 'location_updates' FROM loc_changed x
+        JOIN staging.resolved_location rl USING (location_key)
+    UNION ALL SELECT ca.vertical, 'location_tombstones' FROM loc_gone x
+        JOIN core.location cl USING (location_key)
+        LEFT JOIN core.account ca ON ca.account_id = cl.account_id
+    UNION ALL SELECT rc.vertical, 'contact_inserts' FROM cont_new x
+        JOIN staging.resolved_contact rc USING (contact_key)
+    UNION ALL SELECT rc.vertical, 'contact_updates' FROM cont_changed x
+        JOIN staging.resolved_contact rc USING (contact_key)
+    UNION ALL SELECT ca.vertical, 'contact_tombstones' FROM cont_gone x
+        JOIN core.contact cc USING (contact_key)
+        JOIN core.account ca ON ca.account_id = cc.account_id
+)
+SELECT coalesce(vertical, '?'), arm, count(*) FROM arms GROUP BY 1, 2
+"""
+
+
+def dry_run_by_vertical(engine: Engine) -> dict[str, DiffCounts]:
+    """dry_run_diff split by vertical — the check that an apply for one
+    vertical changes nothing in another."""
+    out: dict[str, DiffCounts] = {}
+    with engine.connect() as conn:
+        for vertical, arm, n in conn.execute(text(_diff_ctes() + _BY_VERTICAL_SELECT)):
+            setattr(out.setdefault(vertical, DiffCounts()), arm, n)
+    return out
+
+
+def _diff_ctes() -> str:
+    """The WITH clause shared by the dry-run queries: one CTE per diff arm."""
     return f"""
 WITH
 -- ---------------------------------------------------------------
@@ -269,6 +327,7 @@ loc_changed AS (
     SELECT rl.location_key
     FROM staging.resolved_location rl
     JOIN core.location cl ON cl.location_key = rl.location_key
+    LEFT JOIN core.account cm ON cm.account_id = cl.management_account_id
     WHERE {_LOCATION_HASH_EXPR} <> {_LOCATION_CORE_HASH_EXPR}
 ),
 loc_gone AS (
@@ -302,16 +361,6 @@ cont_gone AS (
       AND cc.contact_key IS NOT NULL
       AND cc.is_current = true
 )
-SELECT
-    (SELECT count(*) FROM acct_new)       AS account_inserts,
-    (SELECT count(*) FROM acct_changed)   AS account_updates,
-    (SELECT count(*) FROM acct_gone)      AS account_tombstones,
-    (SELECT count(*) FROM loc_new)        AS location_inserts,
-    (SELECT count(*) FROM loc_changed)    AS location_updates,
-    (SELECT count(*) FROM loc_gone)       AS location_tombstones,
-    (SELECT count(*) FROM cont_new)       AS contact_inserts,
-    (SELECT count(*) FROM cont_changed)   AS contact_updates,
-    (SELECT count(*) FROM cont_gone)      AS contact_tombstones
 """
 
 
@@ -530,7 +579,7 @@ def _apply_location_inserts(conn) -> int:
             geom, boundary,
             geocode_precision, geometry_source,
             maintained_acres, acres_confidence,
-            site_type,
+            site_type, management_account_id,
             first_seen, last_seen
         )
         SELECT
@@ -545,6 +594,7 @@ def _apply_location_inserts(conn) -> int:
             rl.maintained_acres,
             rl.acres_confidence,
             rl.site_type,
+            ma.account_id,
             now() AS first_seen,
             now() AS last_seen
         FROM staging.resolved_location rl
@@ -553,6 +603,9 @@ def _apply_location_inserts(conn) -> int:
         -- apply_account_inserts ran first), the location row is skipped
         -- via the INNER JOIN — it will be picked up on the next run.
         JOIN core.account ca ON ca.account_key = rl.account_key
+        -- The managing firm is an account written in the same run; NULL when
+        -- the location has none (every non-HOA vertical).
+        LEFT JOIN core.account ma ON ma.account_key = rl.management_account_key
         LEFT JOIN core.location cl ON cl.location_key = rl.location_key
         WHERE cl.location_id IS NULL
         ON CONFLICT (location_key) DO NOTHING
@@ -561,23 +614,47 @@ def _apply_location_inserts(conn) -> int:
 
 
 def _apply_location_updates(conn) -> int:
-    """UPDATE mutable fields on core.location rows whose content changed."""
+    """UPDATE mutable fields on core.location rows whose content changed.
+
+    Same CTE shape as _apply_account_updates: cm is the CURRENT managing firm
+    (for the hash check), new_ma the one resolved names (for the update), so
+    the UPDATE target never appears in a FROM-clause join.
+    """
     result = conn.execute(text(f"""
+        WITH changed AS (
+            SELECT
+                cl.location_id,
+                rl.location_name,
+                rl.site_address,
+                rl.geom,
+                rl.boundary,
+                rl.geocode_precision,
+                rl.geometry_source,
+                rl.maintained_acres,
+                rl.acres_confidence,
+                rl.site_type,
+                new_ma.account_id AS new_management_account_id
+            FROM staging.resolved_location rl
+            JOIN core.location cl ON cl.location_key = rl.location_key
+            LEFT JOIN core.account cm ON cm.account_id = cl.management_account_id
+            LEFT JOIN core.account new_ma ON new_ma.account_key = rl.management_account_key
+            WHERE {_LOCATION_HASH_EXPR} <> {_LOCATION_CORE_HASH_EXPR}
+        )
         UPDATE core.location cl
         SET
-            location_name     = rl.location_name,
-            site_address      = rl.site_address,
-            geom              = rl.geom,
-            boundary          = rl.boundary,
-            geocode_precision = rl.geocode_precision,
-            geometry_source   = rl.geometry_source,
-            maintained_acres  = rl.maintained_acres,
-            acres_confidence  = rl.acres_confidence,
-            site_type         = rl.site_type,
+            location_name     = ch.location_name,
+            site_address      = ch.site_address,
+            geom              = ch.geom,
+            boundary          = ch.boundary,
+            geocode_precision = ch.geocode_precision,
+            geometry_source   = ch.geometry_source,
+            maintained_acres  = ch.maintained_acres,
+            acres_confidence  = ch.acres_confidence,
+            site_type         = ch.site_type,
+            management_account_id = ch.new_management_account_id,
             last_seen         = now()
-        FROM staging.resolved_location rl
-        WHERE cl.location_key = rl.location_key
-          AND {_LOCATION_HASH_EXPR} <> {_LOCATION_CORE_HASH_EXPR}
+        FROM changed ch
+        WHERE cl.location_id = ch.location_id
     """))
     return result.rowcount
 

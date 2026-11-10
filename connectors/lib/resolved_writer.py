@@ -80,12 +80,12 @@ _LOCATION_SQL = text("""
     INSERT INTO staging.resolved_location (
         location_key, account_key, vertical, location_name, site_address,
         geom, boundary, geocode_precision, geometry_source,
-        maintained_acres, acres_confidence, site_type
+        maintained_acres, acres_confidence, site_type, management_account_key
     ) VALUES (
         :location_key, :account_key, :vertical, :location_name,
         CAST(:site_address AS jsonb),
         CASE
-            WHEN :_latitude IS NOT NULL AND :_longitude IS NOT NULL
+            WHEN CAST(:_latitude AS numeric) IS NOT NULL AND CAST(:_longitude AS numeric) IS NOT NULL
             THEN ST_SetSRID(
                 ST_MakePoint(
                     CAST(:_longitude AS numeric)::double precision,
@@ -94,12 +94,13 @@ _LOCATION_SQL = text("""
             ELSE NULL
         END,
         CASE
-            WHEN :_boundary_geojson IS NULL THEN NULL
+            WHEN CAST(:_boundary_geojson AS text) IS NULL THEN NULL
             ELSE ST_Multi(ST_CollectionExtract(
                 ST_MakeValid(ST_GeomFromGeoJSON(CAST(:_boundary_geojson AS text))), 3))
         END,
         :geocode_precision, :geometry_source,
-        CAST(:maintained_acres AS numeric), :acres_confidence, :site_type
+        CAST(:maintained_acres AS numeric), :acres_confidence, :site_type,
+        :management_account_key
     )
     ON CONFLICT (location_key) DO UPDATE SET
         account_key       = EXCLUDED.account_key,
@@ -112,7 +113,8 @@ _LOCATION_SQL = text("""
         geometry_source   = EXCLUDED.geometry_source,
         maintained_acres  = EXCLUDED.maintained_acres,
         acres_confidence  = EXCLUDED.acres_confidence,
-        site_type         = EXCLUDED.site_type
+        site_type         = EXCLUDED.site_type,
+        management_account_key = EXCLUDED.management_account_key
 """)
 
 _CONTACT_SQL = text("""
@@ -200,8 +202,10 @@ def replace_and_upsert(
 
     # location_df need not carry boundary at all; default the parameter so the SQL
     # binds cleanly for callers that only have points.
+    # Likewise management_account_key: only the HOA vertical has a managing firm.
     for row in loc_rows:
         row.setdefault("_boundary_geojson", None)
+        row.setdefault("management_account_key", None)
     if not location_df.empty:
         for row, (_, src) in zip(loc_rows, location_df.iterrows()):
             row["_latitude"] = src.get("_latitude")

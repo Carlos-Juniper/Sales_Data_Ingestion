@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         from lib.db import get_engine
-        from lib.core_writer import dry_run_diff, apply_core_diff
+        from lib.core_writer import dry_run_by_vertical, dry_run_diff, apply_core_diff
     except ImportError as exc:
         logger.error("Import failed — run with PYTHONPATH=connectors: %s", exc)
         return 1
@@ -108,6 +108,9 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("dry-run mode — no writes will occur")
             counts = dry_run_diff(engine)
             _print_counts(counts, mode="dry-run")
+            # The diff spans every vertical: show which one each change is in.
+            for vertical, c in sorted(dry_run_by_vertical(engine).items()):
+                _print_counts(c, mode=f"dry-run, vertical={vertical}")
             return 0
 
         # Apply mode
