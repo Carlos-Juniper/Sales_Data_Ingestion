@@ -624,6 +624,67 @@ Traps found on the run:
   The fetcher retries, and `--ids-file` accepts a saved `returnIdsOnly`
   response so a rerun skips the ID query.
 
+**Miss analysis, 2026-11-10 (Hillsborough).** We sampled the unmatched rows
+of both weak links and sorted them by cause.
+
+| Link | Before | After |
+|---|---|---|
+| Locations with a management firm | 55.9% (3,486 of 6,084 parcels have one) | 66.3% |
+| DBPR managing entity routed to a `CAB` firm | 60.2% | 61.4% (178/290) |
+| DBPR entity with no firm route, firm found by office address | — | 50/327 |
+| F1 `C/O` → `CAB` firm (statewide) | 90.1% | 90.6% |
+
+Location firm source after: parcel `C/O` 1,741, newer source 1,104,
+registered agent 885, office address 409, none 1,945. 58 locations (6
+associations) switched firm: the current F1 report names a different firm
+than the tax roll, and the newer source wins as before.
+
+Parcel misses by cause (2,598 parcels / 953 accounts before the fix):
+
+| Cause | Parcels | Fixable |
+|---|---|---|
+| No `C/O`; registered agent is a person (self-managed) | 775 | no |
+| No `C/O`; registered agent is a law firm or RA service | 620 | no |
+| Parcel-only owner, no `C/O`, no F1 match | 372 | no |
+| Owner mailing address is a `CAB` firm's office (one licensee there) | 340 | **fixed** (address) |
+| All-generic DBA (`C/O CONDOMINIUM ASSOCIATES`) or cut suffix (`… MGT LL`) | 199 | **fixed** |
+| Firm holds no `CAB` license (Continental Group, Rampart, …) | 89 | no |
+| Person / board member `C/O` | 68 | no |
+| Other `C/O` kinds (association, district, legal) | 61 | mostly no |
+| Sub-association whose master has a firm | 27 | follow-up |
+| Review-tier name match | 24 | review queue |
+| `Castle Group` (licensed as Castle Management) | 23 | **fixed** (alias) |
+
+Ceiling: about 1,985 of the 2,598 misses have no licensed firm in any of our
+sources. With the sub-association and review rows resolved, locations top
+out near 68% (we are at 66.3%) without a new source.
+
+DBPR route misses: about 90 are "Sterling Management" in Sun City Center,
+which holds no `CAB` license (the only Sterling licensee is in Cutler Bay); about 13 are
+other unlicensed firms; about 6 are owner/developer LLCs. These are true
+no-matches. The other 309 routes are persons or blank.
+
+What changed:
+
+- **Generic DBA at the holder's ZIP** (`full_zip`). A `C/O` made only of
+  generic words never matched. It now matches when exactly one licensee spells
+  it that way (legal suffixes aside) and has its office at that ZIP.
+- **Cut legal suffix.** A trailing `LL` / `IN` (a 35-character field cut inside
+  `LLC` / `INC`) is dropped before matching.
+- **Office address** (`FirmAddressIndex`, last resort). The F1 mailing
+  address, the DBPR managing-entity address or the parcel owner address
+  matches a `CAB` firm's office when the street and ZIP are equal and only one
+  licensee is there. The street needs a house number or a PO box. Different
+  suites are different offices. The rule is skipped when the `C/O` names a
+  company, since the address then belongs to that company.
+- **Alias** `CASTLE GROUP` → Castle Management LLC.
+
+Precision. Where F1 names a firm, the address rule picks the same firm
+94.8% of the time (5,158/5,439 statewide); several disagreements are sister
+companies. In spot checks, 22 of 25 new location matches showed visible
+evidence for the firm (name, DBA or office address) and none were wrong. All
+20 sampled DBPR address matches and the 7 new DBPR name matches were correct.
+
 **Phase 3 — enrich and serve.**
 
 11. Point `hoa_gmaps_enrich.py` at Florida associations that have no CAM firm

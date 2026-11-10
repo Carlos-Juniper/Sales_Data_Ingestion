@@ -61,11 +61,13 @@ from hoa.fl_match import (
     FIRM_REVIEW_METHODS,
     REVIEW_METHODS,
     AssociationIndex,
+    FirmAddressIndex,
     FirmIndex,
     Match,
     care_of_kind,
     firm_canon,
     firm_key,
+    parse_care_of,
 )
 from lib.keys import compute_account_key, compute_contact_key, compute_location_key, is_present
 from lib.normalize import normalize_name
@@ -93,6 +95,7 @@ NOT_ASSOCIATION = re.compile(r"\b(MINISTR\w*|CHURCH|BOOSTERS?|ACADEMY|SCHOOL|LEA
 # Checked before the firm-kind gate: "KWPMC" reads as a person's name.
 FIRM_ALIASES = {
     "KWPMC": "CAB3320",  # KW Property Management & Consulting
+    "CASTLE GROUP": "CAB3838",  # The Castle Group = Castle Management LLC
 }
 SQFT_PER_ACRE = 43560.0
 
@@ -233,9 +236,31 @@ def _firm_link(idx: FirmIndex, text: Optional[str], zip5: Optional[str]) -> Link
         return Link(None, "not_firm")
     kind, key = care_of_kind(text), firm_key(firm_canon(text))
     if not (kind == "firm" or key in idx.aliases or (kind == "person" and key in idx.by_key)):
-        return Link(None, "not_firm")
+        # An all-generic DBA reads as an association ("CONDOMINIUM
+        # ASSOCIATES"); at its holder's own office ZIP it is that firm.
+        lic = idx.full_at_zip(text, zip5 or "") if kind in ("association", "generic", "person") else None
+        return Link(lic, "full_zip") if lic else Link(None, "not_firm")
     m = idx.lookup(text, zip5 or "")
     return Link(m.doc, m.method, m.score or 1.0)
+
+
+def _address_firm(adx: FirmAddressIndex, route: Optional[str], street: Optional[str],
+                  zip5: Optional[str]) -> Optional[str]:
+    """The CAB firm whose office is this mailing address.
+
+    Used only when the C/O names no other business: under "C/O <company>" the
+    address is that company's, licensed or not.
+    """
+    if route and care_of_kind(route) not in ("person", "generic"):
+        return None
+    return adx.lookup(street, zip5)
+
+
+def _mail_street(addr: Optional[dict]) -> Optional[str]:
+    """Street line of an F1 address; addr1 is a C/O line when one is given."""
+    addr = addr or {}
+    a1 = addr.get("addr1")
+    return addr.get("addr2") if parse_care_of(a1) else a1
 
 
 def _assoc_link(m: Match) -> Link:
@@ -259,6 +284,9 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
                              r.zip5 or "") for r in firms.itertuples(index=False)],
                            aliases={k: v for k, v in FIRM_ALIASES.items()
                                     if v in set(firms["natural_key"])})
+
+    adx = FirmAddressIndex.build((r.natural_key, r.address_line_1, r.zip5)
+                                 for r in firms.itertuples(index=False))
 
     def queue(strategy, src_a, key_a, src_b, key_b, link: Link):
         review.append({"source_a": src_a, "key_a": key_a, "source_b": src_b, "key_b": key_b,
@@ -323,6 +351,7 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
     f1_firm: dict[str, Link] = {}
     f1_agent: dict[str, str] = {}  # doc -> CAB license serving as registered agent
     f1_agent_firm: set[str] = set()
+    f1_addr: dict[str, str] = {}  # doc -> CAB license whose office is the F1 address
     for d, r in sb.items():
         a = r.attrs
         co = _firm_link(fidx, a.get("care_of"),
@@ -340,6 +369,13 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
             f1_firm[d] = co
         if agent.target and agent.method not in FIRM_REVIEW_METHODS:
             f1_agent[d] = agent.target
+        if not co.target:
+            for x in ("mailing", "principal"):
+                ad = a.get(x) or {}
+                lic = _address_firm(adx, a.get("care_of"), _mail_street(ad), _zip5(ad.get("zip")))
+                if lic:
+                    f1_addr[d] = lic
+                    break
         if any(lk.target and lk.method not in FIRM_REVIEW_METHODS for lk in (co, agent)):
             if r.segment != "association_name" and NOT_ASSOCIATION.search((r.name_raw or "").upper()):
                 stats["f1_firm_agent_excluded"]["not_association_name"] += 1
@@ -365,7 +401,8 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
     # -- accounts
     accounts: dict[str, dict] = {}
     assoc_firm: dict[str, Link] = {}
-    agent_firm: dict[str, str] = {}  # last resort: the CAB firm is the registered agent
+    agent_firm: dict[str, str] = {}  # the CAB firm is the registered agent
+    addr_firm: dict[str, str] = {}  # last resort: the mailing address is a CAB firm's office
     acct_zips: dict[str, set[str]] = defaultdict(set)
 
     def add_account(row: dict) -> str:
@@ -390,6 +427,8 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
                 assoc_firm.setdefault(k, Link(f1_firm[d].target, "f1_care_of"))
             if d in f1_agent:
                 agent_firm.setdefault(k, f1_agent[d])
+            if d in f1_addr:
+                addr_firm.setdefault(k, f1_addr[d])
             acct_zips[k] |= {z for z in (_zip5((a.get(x) or {}).get("zip"))
                                          for x in ("principal", "mailing")) if z}
         return k
@@ -430,6 +469,12 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
             queue(STRATEGY_FIRM, DBPR, e["projects"][0].natural_key, CAM, fl.target, fl)
         elif fl.target:
             assoc_firm[k] = Link(fl.target, "dbpr_route")  # newest source wins
+        else:
+            me = e["me"]
+            lic = _address_firm(adx, route, me.get("street"), _zip5(me.get("zip")))
+            stats["dbpr_address_to_cab"]["address" if lic else "none"] += 1
+            if lic:
+                addr_firm[k] = lic
 
     owner_account: dict[tuple, str] = {}
     for key, o in owners.items():
@@ -481,9 +526,15 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
                 queue(STRATEGY_FIRM, PARCEL, p.natural_key, CAM, fl.target, fl)
             own_firm = fl.target if fl.target and fl.method not in FIRM_REVIEW_METHODS else None
             best = assoc_firm.get(k)
-            lic = best.target if best else own_firm or agent_firm.get(k)
+            agent = agent_firm.get(k)
+            own_addr = None if fl.target else _address_firm(
+                adx, a.get("care_of"), (a.get("owner") or {}).get("addr1"),
+                _zip5((a.get("owner") or {}).get("zip")))
+            addr = addr_firm.get(k) or own_addr
+            lic = best.target if best else own_firm or agent or addr
             stats["location_firm_from"]["newer_source" if best else "parcel_care_of" if own_firm
-                                        else "f1_agent" if lic else "none"] += 1
+                                        else "f1_agent" if agent else "address" if addr
+                                        else "none"] += 1
             if best and own_firm and own_firm != best.target:
                 stats["parcel_firm_vs_newer_source"]["disagree"] += 1
             elif best and own_firm:
@@ -507,7 +558,7 @@ def resolve(sunbiz: pd.DataFrame, projects: pd.DataFrame, cam: pd.DataFrame,
             })
     for num, e in entities.items():
         k = entity_account[num]
-        lic = (assoc_firm.get(k) or Link(None, "")).target or agent_firm.get(k)
+        lic = (assoc_firm.get(k) or Link(None, "")).target or agent_firm.get(k) or addr_firm.get(k)
         for p in e["projects"]:
             locs.append({
                 "location_key": compute_location_key(

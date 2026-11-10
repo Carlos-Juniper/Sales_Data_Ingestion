@@ -270,3 +270,86 @@ def test_unnamed_managing_entity_takes_project_name():
     res = m.resolve(*frames([], pr, [FIRM], []))
     k = compute_account_key({"dbpr_managing_entity": "ME7"}, priority=m.ASSOC_PRIORITY)
     assert res.account.set_index("account_key").loc[k, "legal_name"] == "TEST HARBOR"
+
+
+# ---------------------------------------------------------------- generic DBA / office address
+
+PHP = firm("CAB5", "TEST HOLDINGS LLC", zip_="33716", dba=["CONDOMINIUM ASSOCIATES"])
+
+
+def test_generic_dba_care_of_reaches_holder_at_its_zip():
+    idx = m.FirmIndex.build([("CAB5", "TEST HOLDINGS LLC", "CONDOMINIUM ASSOCIATES", "33716")])
+    lk = m._firm_link(idx, "CONDOMINIUM ASSOCIATES", "33716")
+    assert (lk.target, lk.method) == ("CAB5", "full_zip")
+    assert m._firm_link(idx, "CONDOMINIUM ASSOCIATES", "33647").method == "not_firm"
+
+
+def test_f1_generic_dba_sets_location_firm():
+    sb = [sunbiz("N1", "TEST LAKES HOMEOWNERS ASSOCIATION, INC.", care_of="CONDOMINIUM ASSOCIATES")]
+    sb[0]["attrs"]["mailing"] = {"addr1": "C/O CONDOMINIUM ASSOCIATES", "addr2": "570 TEST PKWY",
+                                 "zip": "33716"}
+    pc = [parcel("39:A", "TEST LAKES HOMEOWNERS ASSOCIAT", "association")]
+    res = m.resolve(*frames(sb, [], [FIRM, PHP], pc))
+    assert res.location.iloc[0]["management_account_key"] == fkey("CAB5")
+
+
+def office(lic, name, street, zip_):
+    f = firm(lic, name, zip_=zip_)
+    f["address_line_1"] = street
+    return f
+
+
+OFFICE = office("CAB8", "TEST REALTY GROUP, INC.", "2906 TEST LAKE BLVD", "33614")
+
+
+@pytest.mark.parametrize("route,lic", [
+    (None, "CAB8"),
+    ("PERSON FOUR", "CAB8"),          # a board member at the firm's office
+    ("TEST HOLDINGS CO", None),       # the address belongs to the named company
+])
+def test_address_firm_respects_care_of(route, lic):
+    adx = m.FirmAddressIndex.build([("CAB8", "2906 TEST LAKE BLVD", "33614")])
+    assert m._address_firm(adx, route, "2906 Test Lake Blvd.", "33614") == lic
+
+
+def test_mail_street_skips_care_of_line():
+    assert m._mail_street({"addr1": "C/O TEST MGMT", "addr2": "1 MAIN ST"}) == "1 MAIN ST"
+    assert m._mail_street({"addr1": "1 MAIN ST"}) == "1 MAIN ST"
+    assert m._mail_street(None) is None
+
+
+def test_f1_mailing_address_at_firm_office_is_last_resort():
+    sb = [sunbiz("N1", "TEST LAKES HOMEOWNERS ASSOCIATION, INC."),
+          sunbiz("N2", "TEST HILLS HOMEOWNERS ASSOCIATION, INC.", care_of="TEST PROPERTY MANAGEMENT")]
+    for s_ in sb:
+        s_["attrs"]["mailing"] = {"addr1": "2906 Test Lake Blvd", "zip": "33614"}
+    pc = [parcel("39:A", "TEST LAKES HOMEOWNERS ASSOCIAT", "association"),
+          parcel("39:B", "TEST HILLS HOMEOWNERS ASSOCIAT", "association")]
+    res = m.resolve(*frames(sb, [], [FIRM, OFFICE], pc))
+    loc = res.location.set_index("location_name")["management_account_key"]
+    assert loc["TEST LAKES HOMEOWNERS ASSOCIAT"] == fkey("CAB8")   # address only
+    assert loc["TEST HILLS HOMEOWNERS ASSOCIAT"] == fkey("CAB1")   # the named firm wins
+    assert res.stats["location_firm_from"] == {"address": 1, "newer_source": 1}
+
+
+def test_parcel_owner_address_at_firm_office():
+    pc = [parcel("39:A", "TEST LAKES HOMEOWNERS ASSOCIAT", "association"),
+          parcel("39:B", "TEST HILLS HOMEOWNERS ASSOCIAT", "association", care_of="TEST HOLDINGS CO")]
+    for p_ in pc:
+        p_["attrs"]["owner"].update(addr1="2906 TEST LAKE BLVD", zip="33614")
+    res = m.resolve(*frames([], [], [FIRM, OFFICE], pc))
+    loc = res.location.set_index("location_name")["management_account_key"]
+    assert loc["TEST LAKES HOMEOWNERS ASSOCIAT"] == fkey("CAB8")
+    assert pd.isna(loc["TEST HILLS HOMEOWNERS ASSOCIAT"])          # C/O names another company
+
+
+def test_dbpr_managing_entity_address_at_firm_office():
+    pr = [project("condo:1", "TEST TOWERS", "ME1", "TEST TOWERS CONDOMINIUM ASSOCIATION, INC.")]
+    pr[0]["attrs"]["managing_entity"].update(street="2906 TEST LAKE BOULEVARD", zip="33614")
+    res = m.resolve(*frames([], pr, [FIRM, OFFICE], []))
+    assert res.location.iloc[0]["management_account_key"] == fkey("CAB8")
+    assert res.stats["dbpr_address_to_cab"] == {"address": 1}
+
+
+def test_castle_group_alias_targets_a_real_license():
+    assert m.FIRM_ALIASES["CASTLE GROUP"].startswith("CAB")

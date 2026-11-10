@@ -9,6 +9,7 @@ import pytest
 
 from connectors.hoa.fl_match import (
     AssociationIndex,
+    FirmAddressIndex,
     FirmIndex,
     Match,
     assoc_canon,
@@ -16,6 +17,7 @@ from connectors.hoa.fl_match import (
     designators,
     firm_canon,
     parse_care_of,
+    street_key,
     types_compatible,
 )
 
@@ -329,3 +331,80 @@ def test_shared_key_with_two_spellings_is_not_a_branch():
     assert idx.lookup("SEA BREEZE MANAGEMENT", "32459").method == "ambiguous"
     m = idx.lookup("SENTRY MANAGEMENT", "32459")
     assert (m.doc, m.method) == ("CAB0103", "exact_multi_branch")
+
+
+def test_suffix_cut_inside_llc(fidx):
+    # A 35-char C/O field ends "... ASSOCIATION MGT LL".
+    assert firm_canon("CENTRAL FLORIDA COMMUNITY MGT LL") == firm_canon("CENTRAL FLORIDA COMMUNITY MGMT LLC")
+    assert fidx.lookup("CENTRAL FLORIDA COMMUNITY MGT LL", "32801").doc == "CAB0004"
+
+
+def test_generic_dba_matches_only_at_holder_zip():
+    idx = FirmIndex.build(FIRM_ROWS + [("CAB0018", "TEST SERVICES LLC", "CONDOMINIUM ASSOCIATES", "33716")])
+    m = idx.lookup("CONDOMINIUM ASSOCIATES", "33716")
+    assert (m.doc, m.method, m.auto) == ("CAB0018", "full_zip", True)
+    assert idx.lookup("CONDOMINIUM ASSOCIATES", "33602").doc is None
+    assert idx.lookup("CONDOMINIUM ASSOCIATES", "").doc is None
+    # A different generic spelling is not the DBA.
+    assert idx.lookup("CONDOMINIUM MANAGEMENT", "33716").doc is None
+
+
+def test_generic_dba_shared_by_two_holders_at_one_zip_is_none():
+    idx = FirmIndex.build([("CAB1", "ONE TEST LLC", "PROPERTY SERVICES", "33716"),
+                           ("CAB2", "TWO TEST LLC", "PROPERTY SERVICES", "33716")])
+    assert idx.full_at_zip("PROPERTY SERVICES", "33716") is None
+
+
+# ---------------------------------------------------------------- firm offices
+
+@pytest.mark.parametrize("street,key", [
+    ("3018 N. US Highway 301, Suite #950", ("3018 N US HWY 301", "950")),
+    ("3018 NORTH U.S. HWY 301 STE 950", ("3018 N US HWY 301", "950")),
+    ("100 Test Blvd #250w", ("100 TEST BLVD", "250W")),
+    ("100 Test Boulevard", ("100 TEST BLVD", "")),
+    ("P.O. Box 2878", ("PO BOX 2878", "")),
+    ("POST OFFICE BOX 2878", ("PO BOX 2878", "")),
+    ("36181 East Test Rd", ("36181 E TEST RD", "")),
+    (None, ("", "")),
+])
+def test_street_key(street, key):
+    assert street_key(street) == key
+
+
+@pytest.fixture(scope="module")
+def adx() -> FirmAddressIndex:
+    return FirmAddressIndex.build([
+        ("CAB0001", "3018 N US HIGHWAY 301 SUITE 950", "33619"),
+        ("CAB0002", "PO BOX 2878", "33509-2878"),
+        # One office tower, five licensees.
+        *((f"CAB01{i}", "570 TEST PARKWAY", "33716") for i in range(5)),
+        ("CAB0003", "100 TEST BLVD STE 200", "33624"),
+        ("CAB0004", "100 TEST BLVD STE 300", "33624"),
+        ("CAB0005", "TEST PLAZA", "33602"),
+    ])
+
+
+def test_address_names_its_one_firm(adx):
+    assert adx.lookup("3018 N. U.S. Highway 301", "33619") == "CAB0001"   # no suite given
+    assert adx.lookup("3018 N US Hwy 301 Ste 950", "33619") == "CAB0001"
+    assert adx.lookup("P.O. BOX 2878", "33509") == "CAB0002"
+
+
+def test_address_needs_the_same_zip(adx):
+    assert adx.lookup("3018 N US Hwy 301", "33610") is None
+    assert adx.lookup("3018 N US Hwy 301", None) is None
+
+
+def test_shared_building_names_no_firm(adx):
+    assert adx.lookup("570 Test Pkwy", "33716") is None
+
+
+def test_suite_separates_offices(adx):
+    assert adx.lookup("100 Test Blvd Suite 200", "33624") == "CAB0003"
+    assert adx.lookup("100 Test Blvd #300", "33624") == "CAB0004"
+    assert adx.lookup("100 Test Blvd", "33624") is None            # either suite
+    assert adx.lookup("3018 N US Hwy 301 Ste 100", "33619") is None
+
+
+def test_street_without_number_names_no_firm(adx):
+    assert adx.lookup("TEST PLAZA", "33602") is None

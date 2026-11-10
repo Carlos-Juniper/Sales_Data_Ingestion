@@ -475,6 +475,7 @@ _FIRM_TAIL_WORDS: tuple[str, ...] = (
     "FLORIDA", "INCORPORATED", "MANAGEMENT", "PROPERTY", "PROPERTIES", "SERVICES",
     "COMPANY", "CORPORATION", "ASSOCIATION", "ASSOCIATES",
 )
+_CUT_SUFFIX = frozenset({"LL", "IN"})
 # Misspellings of the generic words are common in C/O lines ("SEVICES",
 # "PROPERT", "MANGEMENT"); they would otherwise count as distinctive.
 _FIRM_SPELLCHECK: tuple[str, ...] = (
@@ -534,6 +535,9 @@ def firm_canon(name: Optional[str]) -> str:
     # A C/O line cut mid-word: "... OF CENTRAL FLORID".
     if len(out) > 1 and len(out[-1]) >= 3 and any(
             w.startswith(out[-1]) and w != out[-1] for w in _FIRM_TAIL_WORDS):
+        out.pop()
+    # ... or cut inside the legal suffix: "... ASSOCIATION MGT LL".
+    if len(out) > 1 and out[-1] in _CUT_SUFFIX:
         out.pop()
     return " ".join(out)
 
@@ -668,7 +672,7 @@ class FirmRecord:
     dba: bool = False   # a DBA spelling, not the licensee's own name
 
 
-FIRM_AUTO_METHODS = frozenset({"alias", "exact", "exact_full", "distinct_full", "distinct_prefix_full", "firm_fuzzy_zip", "exact_zip", "exact_multi_branch",
+FIRM_AUTO_METHODS = frozenset({"alias", "full_zip", "address", "exact", "exact_full", "distinct_full", "distinct_prefix_full", "firm_fuzzy_zip", "exact_zip", "exact_multi_branch",
                                "distinct", "distinct_zip", "distinct_multi_branch",
                                "distinct_prefix", "distinct_prefix_zip",
                                "distinct_prefix_multi_branch"})
@@ -683,6 +687,7 @@ class FirmIndex:
     by_key: dict[str, set[int]] = field(default_factory=lambda: defaultdict(set))
     by_distinct: dict[str, set[int]] = field(default_factory=lambda: defaultdict(set))
     by_first: dict[str, set[int]] = field(default_factory=lambda: defaultdict(set))
+    by_full: dict[str, set[int]] = field(default_factory=lambda: defaultdict(set))
     aliases: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -706,6 +711,7 @@ class FirmIndex:
                 i = len(idx.variants)
                 idx.variants.append(rec)
                 idx.by_key[rec.key].add(i)
+                idx.by_full[full].add(i)
                 if rec.distinct:
                     idx.by_distinct[firm_key(rec.distinct)].add(i)
                     idx.by_first[rec.distinct.split()[0]].add(i)
@@ -721,7 +727,8 @@ class FirmIndex:
         c = firm_canon(name)
         d = firm_distinct(c)
         if not d:
-            return Match(None, "none", 0.0)
+            lic = self.full_at_zip(name, zip5)
+            return Match(lic, "full_zip") if lic else Match(None, "none", 0.0)
         k = firm_key(c)
         full = _firm_full(name)
         if k in self.aliases:
@@ -769,6 +776,19 @@ class FirmIndex:
             method = "firm_fuzzy_zip" if zip5 and rec.zip5 == zip5[:5] else "fuzzy_review"
             return Match(rec.license_no, method, best / 100.0)
         return Match(None, "none", 0.0)
+
+    def full_at_zip(self, name: Optional[str], zip5: str) -> Optional[str]:
+        """The one license spelled *name* exactly (legal suffixes aside) whose
+        office is at *zip5*.
+
+        An all-generic DBA ("CONDOMINIUM ASSOCIATES") is never enough on its
+        own, but at its holder's own office ZIP it is that holder.
+        """
+        if not zip5:
+            return None
+        lics = {self.variants[i].license_no for i in self.by_full.get(_firm_full(name), ())
+                if self.variants[i].zip5 == zip5[:5]}
+        return next(iter(lics)) if len(lics) == 1 else None
 
     def _prefix_pool(self, d: str) -> set[int]:
         # Candidates share the first letters; "NEWGAUGE" must find "NEW GAUGE".
@@ -841,3 +861,64 @@ def _word_prefix(a: str, b: str) -> bool:
         if len(acc) >= len(short):
             return False
     return False
+
+
+# ---------------------------------------------------------------- firm offices
+
+# "Suite #950" arrives as "SUITE STE 950": take the value after the last unit word.
+_UNIT = re.compile(r"\b(?:(?:SUITE|STE|UNIT|APT|BLDG|BUILDING|OFFICE|FL|FLOOR)\b\s*)+(\w*)")
+_STREET_MAP: dict[str, str] = {
+    "STREET": "ST", "AVENUE": "AVE", "AV": "AVE", "BOULEVARD": "BLVD", "DRIVE": "DR", "ROAD": "RD",
+    "HIGHWAY": "HWY", "PARKWAY": "PKWY", "COURT": "CT", "LANE": "LN", "PLACE": "PL",
+    "CIRCLE": "CIR", "TRAIL": "TRL", "TERRACE": "TER", "SQUARE": "SQ", "WAY": "WAY",
+    "NORTH": "N", "SOUTH": "S", "EAST": "E", "WEST": "W",
+    "NORTHEAST": "NE", "NORTHWEST": "NW", "SOUTHEAST": "SE", "SOUTHWEST": "SW",
+}
+
+
+def street_key(street: Optional[str]) -> tuple[str, str]:
+    """(street, unit) for comparing a mailing address with a firm's office.
+
+    "3018 N. US Highway 301, Suite #950" -> ("3018 N US HWY 301", "950").
+    "P.O. Box 2878" -> ("PO BOX 2878", "").
+    """
+    s = str(street or "").upper().replace("#", " STE ")
+    s = re.sub(r"[^A-Z0-9 ]", " ", s.replace(".", ""))
+    s = re.sub(r"\b(POST OFFICE|P O)\b", "PO", " ".join(s.split()))
+    unit = ""
+    m = _UNIT.search(s)
+    if m and not s.startswith("PO BOX"):
+        unit, s = m.group(1), s[:m.start()]
+    return " ".join(_STREET_MAP.get(t, t) for t in s.split()), unit
+
+
+@dataclass
+class FirmAddressIndex:
+    """CAB firm offices by street and ZIP: a mailing address that is a firm's
+    office names the firm when the C/O line does not."""
+    by_street: dict[tuple[str, str], set[tuple[str, str]]] = field(
+        default_factory=lambda: defaultdict(set))
+
+    @classmethod
+    def build(cls, rows: Iterable[tuple[str, Optional[str], Optional[str]]]) -> "FirmAddressIndex":
+        """rows: (license_no, address_line_1, zip) for each CAB record."""
+        idx = cls()
+        for lic, street, zip_ in rows:
+            st, unit = street_key(street)
+            if st and zip_:
+                idx.by_street[(st, str(zip_)[:5])].add((lic, unit))
+        return idx
+
+    def lookup(self, street: Optional[str], zip5: Optional[str]) -> Optional[str]:
+        """The one license with its office at this address, or None.
+
+        The street must carry a number or be a PO box, and an office building
+        shared by several licensees ("570 CARILLON PKWY") names none of them.
+        Two different suites are two offices.
+        """
+        st, unit = street_key(street)
+        if not zip5 or not re.match(r"(\d|PO BOX \w)", st):
+            return None
+        hits = {lic for lic, u in self.by_street.get((st, zip5[:5]), ())
+                if not (unit and u and u != unit)}
+        return next(iter(hits)) if len(hits) == 1 else None
