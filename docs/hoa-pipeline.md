@@ -497,6 +497,50 @@ Ordered. Each step has a done-when.
    | Duval, Pinellas, Osceola | none found | none confirmed (Pinellas PA returned 403) |
    | Collier, St. Lucie | unconfirmed (503 / 403) | unconfirmed |
 
+**Matcher calibration — `connectors/hoa/fl_match.py` (done 2026-11-09).**
+Built and tuned before Phase 1 on the real files (Hillsborough F1/F2/F7,
+statewide F2, all 2,070 F4 `CAB` licenses). "Auto" is written without review;
+"+review" adds the pairs queued to `review.match_queue`. Tests:
+`connectors/hoa/tests/test_fl_match.py` (47 cases from the misses below).
+
+| Link | Baseline | Auto | +review | Precision check |
+|---|---|---|---|---|
+| F2/F3 managing entity → F1 (Hillsborough, 599) | 68% name+ZIP, 81% with name-only | 83.0% | 87.5% | 60/60 sampled non-`exact_zip` auto correct. 9 of 10 sampled misses are not in F1 at all (ceiling) |
+| F7 association owner → F1 (Hillsborough, 1,847) | 57% | 83.1% | 88.8% | as above |
+| F7 `C/O` → F4 firm, per parcel (Hillsborough, 3,186 firm-like) | 81.0% (crude `C/O` regex) | 88.1% | 90.5% | 86 sampled non-exact auto: all plausible, 3 borderline (generic-word brands such as `EAST COAST MGMT`) |
+| F7 `C/O` → F4, distinct firm names (106) | 56.0% | 57.5% | 67.0% | misses are mostly firms without a `CAB` license |
+| F2 managing-entity `C/O` → F4 (statewide, 8,747 firm-like) | 78.5% | 78.7% | 84.4% | auto barely moved, but the first pass's false hits (`FIRST …`, `BUSINESS …`) are gone |
+| F1 registered agent → F4 (Hillsborough HOA/condo, 1,074 firm-like agents) | 67.0% | 76.8% | 77.5% | after classing law firms and agent services as `legal` |
+
+What moved the rates:
+
+- **Association names.** Canonical form folds suffixes, glued words
+  (`BREEZEHOMEOWNERS`), `CONDO`/`ASSN` spellings and the 30-character F7 cut
+  (`ASSOCIATI`, `OF HILLSBOROU`). Cascade: exact → prefix (truncated names
+  only) → same core name in a shared ZIP → fuzzy in a shared ZIP (review only).
+  Building and phase designators (`BLDG L`, `NO. 3`) must agree; `, A
+  CONDOMINIUM` is an article, not building A. Condo vs HOA with the same core
+  goes to review. A name-only match is auto only when the F1 address is in the
+  source county or the core name is unique statewide and more than one word;
+  `STONEY CREEK` and the like go to review.
+- **Firm names.** `MANAGEMENT`/`MGT`/`MNGT`… → `MGMT`, legal suffixes dropped,
+  misspelled generic words caught by spell-check (`SEVICES`), initials joined
+  (`A R` → `AR`), singular = plural, a cut tail word dropped (`FLORID`),
+  brands glued (`FIRST SERVICE`, `REAL MANAGE`), every `;`-separated DBA
+  indexed. Generic-only names never match. One distinctive word needs the
+  office in the same 3-digit ZIP; a query longer than the license name
+  (`CAPE CORAL TAX & ACCOUNTING` vs `REALTY ASSOCIATES OF CAPE CORAL`) is
+  review unless the ZIP5 matches; fuzzy is auto only at the licensee's own ZIP.
+- **`C/O` classification.** Each `C/O` is classed as firm, association,
+  district (CDD manager), legal, person or generic, and only firm-like ones are
+  looked up. Person `C/O`s (1,019 of the Hillsborough parcels) need F5/CRM
+  data, not F4.
+
+Remaining misses are coverage, not matching: CDD managers and firms that hold
+no `CAB` license, associations absent from F1, and law-firm registered agents.
+The registered agent is therefore a weak management signal; the `C/O` and the
+DBPR managing entity carry the firm link.
+
 **Phase 1 — load.**
 
 5. Migrations 021–025.
